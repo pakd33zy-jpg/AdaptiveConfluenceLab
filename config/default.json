@@ -1,0 +1,14 @@
+{
+  "score_threshold": 0.28,
+  "trend_adx_min": 22.0,
+  "range_adx_max": 19.0,
+  "trend_chop_max": 55.0,
+  "range_chop_min": 57.0,
+  "min_relative_volume": 0.85,
+  "breakout_relative_volume": 1.15,
+  "max_atr_pct": 2.5,
+  "risk_pct": 0.5,
+  "max_position_pct": 25.0,
+  "daily_loss_limit_pct": 2.0,
+  "max_trades_per_day": 8
+}

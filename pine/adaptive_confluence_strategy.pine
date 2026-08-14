@@ -1,0 +1,427 @@
+//@version=6
+strategy(
+     "Adaptive Confluence Lab v1",
+     overlay = true,
+     initial_capital = 100000,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.01,
+     slippage = 1,
+     process_orders_on_close = false,
+     calc_on_order_fills = true,
+     calc_on_every_tick = false,
+     margin_long = 100,
+     margin_short = 100,
+     use_bar_magnifier = true)
+
+// -----------------------------------------------------------------------------
+// Purpose
+// -----------------------------------------------------------------------------
+// Regime-adaptive, multi-factor strategy inspired by TradingView's official
+// built-in indicator families and built-in strategies. It deliberately groups
+// correlated indicators instead of requiring every indicator to agree.
+//
+// Playbooks:
+// 1) Trend pullback / continuation
+// 2) Squeeze / price-channel breakout
+// 3) Range mean reversion
+//
+// This is a research strategy, not a promise of profitability. Validate with
+// realistic commission/slippage and out-of-sample forward testing.
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+string tradeSession = input.session("0935-1545", "Equity trading session (ET)")
+string htf = input.timeframe("15", "Confirmed higher timeframe")
+float minScore = input.float(0.28, "Minimum directional score", minval = 0.05, maxval = 0.90, step = 0.01)
+float riskPct = input.float(0.50, "Risk per trade (% equity)", minval = 0.05, maxval = 2.00, step = 0.05)
+float maxPositionPct = input.float(25.0, "Max position notional (% equity)", minval = 1.0, maxval = 100.0, step = 1.0)
+float dailyLossLimitPct = input.float(2.0, "Daily loss limit (%)", minval = 0.25, maxval = 10.0, step = 0.25)
+int maxTradesPerDay = input.int(8, "Maximum entries per day", minval = 1, maxval = 50)
+int cooldownBars = input.int(3, "Bars between entries", minval = 0, maxval = 100)
+
+int adxLen = input.int(14, "ADX / DMI length", minval = 5, maxval = 50)
+int adxSmooth = input.int(14, "ADX smoothing", minval = 5, maxval = 50)
+float trendAdxMin = input.float(22.0, "Trend regime ADX minimum", minval = 10, maxval = 50, step = 0.5)
+float rangeAdxMax = input.float(19.0, "Range regime ADX maximum", minval = 5, maxval = 35, step = 0.5)
+float trendChopMax = input.float(55.0, "Trend regime CHOP maximum", minval = 25, maxval = 70, step = 0.5)
+float rangeChopMin = input.float(57.0, "Range regime CHOP minimum", minval = 35, maxval = 80, step = 0.5)
+float minRelVol = input.float(0.85, "Minimum relative volume", minval = 0.2, maxval = 5, step = 0.05)
+float breakoutRelVol = input.float(1.15, "Breakout relative volume", minval = 0.5, maxval = 10, step = 0.05)
+float maxAtrPct = input.float(2.50, "Avoid if ATR% above", minval = 0.25, maxval = 10, step = 0.05)
+
+float trendStopAtr = input.float(1.20, "Trend stop (ATR)", minval = 0.4, maxval = 5, step = 0.05)
+float trendTargetR = input.float(2.00, "Trend target (R)", minval = 0.5, maxval = 8, step = 0.1)
+float breakoutStopAtr = input.float(1.35, "Breakout stop (ATR)", minval = 0.4, maxval = 5, step = 0.05)
+float breakoutTargetR = input.float(2.40, "Breakout target (R)", minval = 0.5, maxval = 10, step = 0.1)
+float meanStopAtr = input.float(1.00, "Mean-reversion stop (ATR)", minval = 0.4, maxval = 5, step = 0.05)
+float meanTargetR = input.float(1.35, "Mean-reversion target (R)", minval = 0.5, maxval = 5, step = 0.05)
+float trailActivateR = input.float(1.00, "Trail activates at R", minval = 0.25, maxval = 5, step = 0.05)
+float trailAtr = input.float(1.10, "Trailing stop distance (ATR)", minval = 0.25, maxval = 5, step = 0.05)
+int maxHoldBars = input.int(36, "Maximum hold bars", minval = 2, maxval = 500)
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+f_sign(float value) => value > 0 ? 1.0 : value < 0 ? -1.0 : 0.0
+f_safe_div(float a, float b) => math.abs(b) > 1e-10 ? a / b : 0.0
+f_rating(bool buy, bool sell) => buy ? 1.0 : sell ? -1.0 : 0.0
+f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
+
+// -----------------------------------------------------------------------------
+// Core trend / moving-average family
+// TradingView Technical Ratings uses SMA/EMA 10,20,30,50,100,200 plus HMA,
+// VWMA and Ichimoku. We use the same families as one grouped vote.
+// -----------------------------------------------------------------------------
+float sma10 = ta.sma(close, 10)
+float sma20 = ta.sma(close, 20)
+float sma30 = ta.sma(close, 30)
+float sma50 = ta.sma(close, 50)
+float sma100 = ta.sma(close, 100)
+float sma200 = ta.sma(close, 200)
+float ema10 = ta.ema(close, 10)
+float ema20 = ta.ema(close, 20)
+float ema30 = ta.ema(close, 30)
+float ema50 = ta.ema(close, 50)
+float ema100 = ta.ema(close, 100)
+float ema200 = ta.ema(close, 200)
+float hma9 = ta.hma(close, 9)
+float vwma20 = ta.vwma(close, 20)
+
+float tenkan = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2.0
+float kijun = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2.0
+float spanA = (tenkan + kijun) / 2.0
+float spanB = (ta.highest(high, 52) + ta.lowest(low, 52)) / 2.0
+float cloudTop = math.max(spanA, spanB)
+float cloudBottom = math.min(spanA, spanB)
+float ichiVote = f_rating(close > cloudTop and tenkan > kijun and spanA > spanB,
+                          close < cloudBottom and tenkan < kijun and spanA < spanB)
+
+float maVotes =
+     f_sign(close - sma10) + f_sign(close - sma20) + f_sign(close - sma30) +
+     f_sign(close - sma50) + f_sign(close - sma100) + f_sign(close - sma200) +
+     f_sign(close - ema10) + f_sign(close - ema20) + f_sign(close - ema30) +
+     f_sign(close - ema50) + f_sign(close - ema100) + f_sign(close - ema200) +
+     f_sign(close - hma9) + f_sign(close - vwma20) + ichiVote
+float maRating = maVotes / 15.0
+
+// -----------------------------------------------------------------------------
+// Oscillator family: RSI, Stoch, CCI, DMI/ADX, AO, Momentum, MACD,
+// Stoch RSI, Williams %R, Bull/Bear Power, Ultimate Oscillator.
+// -----------------------------------------------------------------------------
+float rsi14 = ta.rsi(close, 14)
+float stochRaw = 100.0 * f_safe_div(close - ta.lowest(low, 14), ta.highest(high, 14) - ta.lowest(low, 14))
+float stochK = ta.sma(stochRaw, 3)
+float stochD = ta.sma(stochK, 3)
+float cci20 = ta.cci(hlc3, 20)
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxSmooth)
+float ao = ta.sma(hl2, 5) - ta.sma(hl2, 34)
+float momentum10 = close - close[10]
+[macdLine, macdSignal, macdHist] = ta.macd(close, 12, 26, 9)
+float rsiLow = ta.lowest(rsi14, 14)
+float rsiHigh = ta.highest(rsi14, 14)
+float stochRsiRaw = 100.0 * f_safe_div(rsi14 - rsiLow, rsiHigh - rsiLow)
+float stochRsiK = ta.sma(stochRsiRaw, 3)
+float stochRsiD = ta.sma(stochRsiK, 3)
+float willR = -100.0 * f_safe_div(ta.highest(high, 14) - close, ta.highest(high, 14) - ta.lowest(low, 14))
+float ema13 = ta.ema(close, 13)
+float bullPower = high - ema13
+float bearPower = low - ema13
+float prevClose = nz(close[1], close)
+float bp = close - math.min(low, prevClose)
+float trUo = math.max(high, prevClose) - math.min(low, prevClose)
+float avg7 = f_safe_div(ta.sma(bp, 7) * 7.0, ta.sma(trUo, 7) * 7.0)
+float avg14 = f_safe_div(ta.sma(bp, 14) * 14.0, ta.sma(trUo, 14) * 14.0)
+float avg28 = f_safe_div(ta.sma(bp, 28) * 28.0, ta.sma(trUo, 28) * 28.0)
+float uo = 100.0 * (4.0 * avg7 + 2.0 * avg14 + avg28) / 7.0
+
+float rsiVote = f_rating(rsi14 < 30 and rsi14 > rsi14[1], rsi14 > 70 and rsi14 < rsi14[1])
+float stochVote = f_rating(stochK < 20 and stochD < 20 and stochK > stochD,
+                           stochK > 80 and stochD > 80 and stochK < stochD)
+float cciVote = f_rating(cci20 < -100 and cci20 > cci20[1], cci20 > 100 and cci20 < cci20[1])
+float dmiVote = f_rating(plusDI > minusDI and adx > 20 and adx >= adx[1],
+                         minusDI > plusDI and adx > 20 and adx >= adx[1])
+float aoVote = f_rating((ta.crossover(ao, 0) or (ao > 0 and ao > ao[1] and ao[1] < ao[2])),
+                        (ta.crossunder(ao, 0) or (ao < 0 and ao < ao[1] and ao[1] > ao[2])))
+float momVote = f_sign(momentum10 - momentum10[1])
+float macdVote = f_sign(macdLine - macdSignal)
+float stochRsiVote = f_rating(stochRsiK < 20 and stochRsiD < 20 and stochRsiK > stochRsiD,
+                              stochRsiK > 80 and stochRsiD > 80 and stochRsiK < stochRsiD)
+float willVote = f_rating(willR < -80 and willR > willR[1], willR > -20 and willR < willR[1])
+float bbPowerVote = f_rating(close > ema13 and bearPower < 0 and bearPower > bearPower[1],
+                             close < ema13 and bullPower > 0 and bullPower < bullPower[1])
+float uoVote = f_rating(uo > 55 and uo > uo[1], uo < 45 and uo < uo[1])
+float oscRating = (rsiVote + stochVote + cciVote + dmiVote + aoVote + momVote + macdVote +
+                   stochRsiVote + willVote + bbPowerVote + uoVote) / 11.0
+
+// -----------------------------------------------------------------------------
+// Volume / flow family: VWAP, MFI, CMF, OBV slope, relative volume, VWMA.
+// -----------------------------------------------------------------------------
+float vwap = ta.vwap(hlc3)
+float tp = hlc3
+float rawMoney = tp * volume
+float posMoney = tp > tp[1] ? rawMoney : 0.0
+float negMoney = tp < tp[1] ? rawMoney : 0.0
+float posMoneySum = ta.sma(posMoney, 14) * 14.0
+float negMoneySum = ta.sma(negMoney, 14) * 14.0
+float moneyRatio = f_safe_div(posMoneySum, negMoneySum)
+float mfi14 = negMoneySum == 0 ? 100.0 : 100.0 - 100.0 / (1.0 + moneyRatio)
+float mfMult = f_safe_div((close - low) - (high - close), high - low)
+float cmf20 = f_safe_div(ta.sma(mfMult * volume, 20) * 20.0, ta.sma(volume, 20) * 20.0)
+var float obv = 0.0
+obv += close > close[1] ? volume : close < close[1] ? -volume : 0.0
+float obvEma = ta.ema(obv, 20)
+float volAvg20 = ta.sma(volume, 20)
+float relVol = f_safe_div(volume, volAvg20)
+float volumeDirection = f_sign(close - open)
+float volumeScore = (f_sign(close - vwap) + f_sign(mfi14 - 50) + f_sign(cmf20) +
+                     f_sign(obv - obvEma) + f_sign(vwma20 - sma20) + volumeDirection * f_clamp(relVol / 1.5, 0, 1)) / 6.0
+
+// -----------------------------------------------------------------------------
+// Volatility / regime: ATR%, Bollinger Bands, Keltner squeeze, CHOP, Supertrend.
+// -----------------------------------------------------------------------------
+float atr14 = ta.atr(14)
+float atrPct = 100.0 * f_safe_div(atr14, close)
+float bbBasis = ta.sma(close, 20)
+float bbDev = ta.stdev(close, 20) * 2.0
+float bbUpper = bbBasis + bbDev
+float bbLower = bbBasis - bbDev
+float bbWidth = 100.0 * f_safe_div(bbUpper - bbLower, bbBasis)
+float bbWidthAvg = ta.sma(bbWidth, 50)
+float bbPctB = f_safe_div(close - bbLower, bbUpper - bbLower)
+float kcBasis = ta.ema(close, 20)
+float kcUpper = kcBasis + 1.5 * atr14
+float kcLower = kcBasis - 1.5 * atr14
+bool squeezeOn = bbUpper < kcUpper and bbLower > kcLower
+bool squeezeRelease = squeezeOn[1] and not squeezeOn and bbWidth > bbWidth[1]
+float tr1 = ta.tr(true)
+float chopRange = ta.highest(high, 14) - ta.lowest(low, 14)
+float chop = chopRange > 0 ? 100.0 * math.log10((ta.sma(tr1, 14) * 14.0) / chopRange) / math.log10(14.0) : 100.0
+[supertrendLine, supertrendDir] = ta.supertrend(3.0, 10)
+bool superBull = close > supertrendLine
+bool superBear = close < supertrendLine
+
+// Confirmed HTF trend: offset by one HTF bar and use lookahead_on to avoid repainting.
+if barstate.isfirst and timeframe.in_seconds(htf) <= timeframe.in_seconds(timeframe.period)
+    runtime.error("Confirmed higher timeframe must be greater than chart timeframe.")
+float htfClose = request.security(syminfo.tickerid, htf, close[1], lookahead = barmerge.lookahead_on)
+float htfEma50 = request.security(syminfo.tickerid, htf, ta.ema(close, 50)[1], lookahead = barmerge.lookahead_on)
+float htfRsi = request.security(syminfo.tickerid, htf, ta.rsi(close, 14)[1], lookahead = barmerge.lookahead_on)
+float htfVote = (f_sign(htfClose - htfEma50) + f_sign(htfRsi - 50)) / 2.0
+
+// Previous-day pivot context, also confirmed/non-repainting.
+float pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+float pdl = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
+float pdc = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_on)
+float dailyPivot = (pdh + pdl + pdc) / 3.0
+float pivotVote = f_sign(close - dailyPivot)
+
+// Momentum score uses continuous directional interpretations rather than only
+// overbought/oversold triggers.
+float momentumScore = (f_sign(rsi14 - 50) + f_sign(macdHist) + f_sign(cci20) +
+                       f_sign(momentum10) + f_sign(stochRsiK - stochRsiD) + f_sign(willR + 50)) / 6.0
+float trendExtra = (f_sign(ema20 - ema50) + f_sign(ema50 - ema200) + f_sign(close - vwap) +
+                    (superBull ? 1.0 : -1.0) + htfVote + pivotVote) / 6.0
+
+float directionScore = 0.28 * maRating + 0.18 * oscRating + 0.22 * trendExtra +
+                       0.17 * momentumScore + 0.15 * volumeScore
+
+bool trendRegime = adx >= trendAdxMin and chop <= trendChopMax and math.abs(directionScore) >= minScore * 0.70
+bool rangeRegime = adx <= rangeAdxMax and chop >= rangeChopMin
+bool volatilityOk = atrPct <= maxAtrPct
+bool liquidEnough = relVol >= minRelVol
+
+// -----------------------------------------------------------------------------
+// Price-channel / structure signals inspired by Channel Breakout, Price Channel,
+// Keltner, Bollinger, inside/outside-bar and momentum strategy families.
+// -----------------------------------------------------------------------------
+float donHigh = ta.highest(high, 20)[1]
+float donLow = ta.lowest(low, 20)[1]
+bool insideBar = high < high[1] and low > low[1]
+bool insideBreakLong = insideBar[1] and close > high[1]
+bool insideBreakShort = insideBar[1] and close < low[1]
+bool outsideBar = high > high[1] and low < low[1]
+bool outsideBull = outsideBar and close > open and close > close[1]
+bool outsideBear = outsideBar and close < open and close < close[1]
+
+// Trend pullback / continuation.
+bool pullbackLong = trendRegime and directionScore >= minScore and close > vwap and ema20 > ema50 and
+                    (low <= ema20 or low <= vwap) and close > ema20 and rsi14 >= 45 and rsi14 <= 72 and
+                    liquidEnough and (plusDI > minusDI) and superBull
+bool pullbackShort = trendRegime and directionScore <= -minScore and close < vwap and ema20 < ema50 and
+                     (high >= ema20 or high >= vwap) and close < ema20 and rsi14 <= 55 and rsi14 >= 28 and
+                     liquidEnough and (minusDI > plusDI) and superBear
+
+// Squeeze / breakout. Require expansion + volume + channel break or structure break.
+bool breakoutLong = volatilityOk and (trendRegime or squeezeRelease) and directionScore >= minScore and
+                    relVol >= breakoutRelVol and bbWidth > bbWidth[1] and macdHist > 0 and close > vwap and
+                    (close > donHigh or insideBreakLong or outsideBull)
+bool breakoutShort = volatilityOk and (trendRegime or squeezeRelease) and directionScore <= -minScore and
+                     relVol >= breakoutRelVol and bbWidth > bbWidth[1] and macdHist < 0 and close < vwap and
+                     (close < donLow or insideBreakShort or outsideBear)
+
+// Mean reversion only in a confirmed range regime; enter after price begins to
+// return inside an extreme rather than blindly fading a strong trend.
+bool meanLong = rangeRegime and volatilityOk and bbPctB[1] < 0.05 and bbPctB > bbPctB[1] and
+                rsi14 < 38 and mfi14 < 40 and close < vwap and cmf20 > cmf20[1]
+bool meanShort = rangeRegime and volatilityOk and bbPctB[1] > 0.95 and bbPctB < bbPctB[1] and
+                 rsi14 > 62 and mfi14 > 60 and close > vwap and cmf20 < cmf20[1]
+
+// -----------------------------------------------------------------------------
+// Session / daily risk controls
+// -----------------------------------------------------------------------------
+bool inSession = not na(time(timeframe.period, tradeSession, "America/New_York"))
+bool newDay = ta.change(time("D")) != 0
+var float dayStartEquity = na
+var int tradesToday = 0
+var int lastEntryBar = na
+if barstate.isfirst or newDay
+    dayStartEquity := strategy.equity
+    tradesToday := 0
+float dayPnlPct = na(dayStartEquity) or dayStartEquity == 0 ? 0.0 : 100.0 * (strategy.equity - dayStartEquity) / dayStartEquity
+bool dailyRiskOk = dayPnlPct > -dailyLossLimitPct
+bool cooldownOk = na(lastEntryBar) or bar_index - lastEntryBar > cooldownBars
+bool entryAllowed = inSession and dailyRiskOk and tradesToday < maxTradesPerDay and cooldownOk and strategy.position_size == 0 and barstate.isconfirmed
+
+// -----------------------------------------------------------------------------
+// Setup selection. Breakout gets first priority, then trend pullback, then range.
+// -----------------------------------------------------------------------------
+int longSetup = breakoutLong ? 2 : pullbackLong ? 1 : meanLong ? 3 : 0
+int shortSetup = breakoutShort ? 2 : pullbackShort ? 1 : meanShort ? 3 : 0
+bool wantLong = entryAllowed and longSetup > 0 and shortSetup == 0
+bool wantShort = entryAllowed and shortSetup > 0 and longSetup == 0
+
+f_stop_mult(int setup) => setup == 2 ? breakoutStopAtr : setup == 3 ? meanStopAtr : trendStopAtr
+f_target_r(int setup) => setup == 2 ? breakoutTargetR : setup == 3 ? meanTargetR : trendTargetR
+f_setup_name(int setup) => setup == 2 ? "BREAKOUT" : setup == 3 ? "MEAN" : "TREND"
+
+// Dynamic risk sizing based on stop distance, capped by notional.
+f_qty(float stopDistance) =>
+    float riskCash = strategy.equity * riskPct / 100.0
+    float riskQty = stopDistance > syminfo.mintick ? riskCash / stopDistance : 0.0
+    float notionalCapQty = strategy.equity * maxPositionPct / 100.0 / close
+    math.max(0.0, math.min(riskQty, notionalCapQty))
+
+var int pendingSetup = 0
+if wantLong
+    pendingSetup := longSetup
+    float stopDist = atr14 * f_stop_mult(longSetup)
+    float qty = f_qty(stopDist)
+    if qty > 0
+        strategy.entry("Long", strategy.long, qty = qty, comment = f_setup_name(longSetup))
+        tradesToday += 1
+        lastEntryBar := bar_index
+if wantShort
+    pendingSetup := shortSetup
+    float stopDist = atr14 * f_stop_mult(shortSetup)
+    float qty = f_qty(stopDist)
+    if qty > 0
+        strategy.entry("Short", strategy.short, qty = qty, comment = f_setup_name(shortSetup))
+        tradesToday += 1
+        lastEntryBar := bar_index
+
+// -----------------------------------------------------------------------------
+// Exit management: fixed initial risk, R-multiple target, breakeven/trailing ATR,
+// plus time stop. The exit is recalculated as new favorable extremes appear.
+// -----------------------------------------------------------------------------
+var float entryAtr = na
+var float entryStopDist = na
+var float entryTargetR = na
+var int activeSetup = 0
+var int entryBar = na
+var float highSinceEntry = na
+var float lowSinceEntry = na
+
+bool newLong = strategy.position_size > 0 and strategy.position_size[1] <= 0
+bool newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+bool flatNow = strategy.position_size == 0
+
+if newLong or newShort
+    activeSetup := pendingSetup == 0 ? 1 : pendingSetup
+    entryAtr := atr14
+    entryStopDist := math.max(syminfo.mintick * 2, entryAtr * f_stop_mult(activeSetup))
+    entryTargetR := f_target_r(activeSetup)
+    entryBar := bar_index
+    highSinceEntry := high
+    lowSinceEntry := low
+    pendingSetup := 0
+
+if strategy.position_size > 0
+    highSinceEntry := math.max(nz(highSinceEntry, high), high)
+    float entry = strategy.position_avg_price
+    float initialStop = entry - entryStopDist
+    float target = entry + entryStopDist * entryTargetR
+    float trailActivation = entry + entryStopDist * trailActivateR
+    float atrTrail = highSinceEntry - atr14 * trailAtr
+    float breakeven = entry + syminfo.mintick
+    float stop = highSinceEntry >= trailActivation ? math.max(initialStop, math.max(breakeven, atrTrail)) : initialStop
+    strategy.exit("LX", "Long", stop = stop, limit = target)
+    if not na(entryBar) and bar_index - entryBar >= maxHoldBars
+        strategy.close("Long", comment = "TIME")
+
+if strategy.position_size < 0
+    lowSinceEntry := math.min(nz(lowSinceEntry, low), low)
+    float entry = strategy.position_avg_price
+    float initialStop = entry + entryStopDist
+    float target = entry - entryStopDist * entryTargetR
+    float trailActivation = entry - entryStopDist * trailActivateR
+    float atrTrail = lowSinceEntry + atr14 * trailAtr
+    float breakeven = entry - syminfo.mintick
+    float stop = lowSinceEntry <= trailActivation ? math.min(initialStop, math.min(breakeven, atrTrail)) : initialStop
+    strategy.exit("SX", "Short", stop = stop, limit = target)
+    if not na(entryBar) and bar_index - entryBar >= maxHoldBars
+        strategy.close("Short", comment = "TIME")
+
+if flatNow and strategy.position_size[1] != 0
+    activeSetup := 0
+    entryAtr := na
+    entryStopDist := na
+    entryTargetR := na
+    entryBar := na
+    highSinceEntry := na
+    lowSinceEntry := na
+
+// -----------------------------------------------------------------------------
+// Visuals
+// -----------------------------------------------------------------------------
+plot(vwap, "VWAP", color = color.new(color.blue, 0), linewidth = 2)
+plot(ema20, "EMA 20", color = color.new(color.orange, 0))
+plot(ema50, "EMA 50", color = color.new(color.yellow, 0))
+plot(ema200, "EMA 200", color = color.new(color.purple, 0))
+plot(supertrendLine, "Supertrend", color = superBull ? color.new(color.green, 10) : color.new(color.red, 10), linewidth = 2)
+plot(bbUpper, "BB Upper", color = color.new(color.gray, 70))
+plot(bbLower, "BB Lower", color = color.new(color.gray, 70))
+
+bgcolor(trendRegime ? color.new(directionScore >= 0 ? color.green : color.red, 92) :
+        rangeRegime ? color.new(color.blue, 94) :
+        squeezeOn ? color.new(color.yellow, 94) : na)
+
+plotshape(wantLong, title = "Long setup", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny, text = "L")
+plotshape(wantShort, title = "Short setup", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny, text = "S")
+
+var table dash = table.new(position.top_right, 2, 10, border_width = 1)
+if barstate.islast
+    table.cell(dash, 0, 0, "Adaptive Confluence", text_color = color.white, bgcolor = color.black)
+    table.cell(dash, 1, 0, "v1", text_color = color.white, bgcolor = color.black)
+    table.cell(dash, 0, 1, "Score")
+    table.cell(dash, 1, 1, str.tostring(directionScore, "#.###"), text_color = directionScore >= 0 ? color.lime : color.red)
+    table.cell(dash, 0, 2, "MA rating")
+    table.cell(dash, 1, 2, str.tostring(maRating, "#.##"))
+    table.cell(dash, 0, 3, "Osc rating")
+    table.cell(dash, 1, 3, str.tostring(oscRating, "#.##"))
+    table.cell(dash, 0, 4, "Volume")
+    table.cell(dash, 1, 4, str.tostring(volumeScore, "#.##"))
+    table.cell(dash, 0, 5, "ADX / CHOP")
+    table.cell(dash, 1, 5, str.tostring(adx, "#.0") + " / " + str.tostring(chop, "#.0"))
+    table.cell(dash, 0, 6, "RelVol")
+    table.cell(dash, 1, 6, str.tostring(relVol, "#.00") + "x")
+    table.cell(dash, 0, 7, "ATR%")
+    table.cell(dash, 1, 7, str.tostring(atrPct, "#.00") + "%")
+    table.cell(dash, 0, 8, "Regime")
+    table.cell(dash, 1, 8, trendRegime ? "TREND" : rangeRegime ? "RANGE" : squeezeOn ? "SQUEEZE" : "NEUTRAL")
+    table.cell(dash, 0, 9, "Day P&L")
+    table.cell(dash, 1, 9, str.tostring(dayPnlPct, "#.00") + "%", text_color = dayPnlPct >= 0 ? color.lime : color.red)
+
+alertcondition(wantLong, "Adaptive Confluence LONG", "Adaptive Confluence LONG setup")
+alertcondition(wantShort, "Adaptive Confluence SHORT", "Adaptive Confluence SHORT setup")
