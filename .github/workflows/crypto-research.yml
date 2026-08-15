@@ -1,0 +1,67 @@
+name: Crypto Research
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/crypto_v5_ci.py"
+      - "scripts/research_crypto_rotation.py"
+      - "tests/test_crypto_rotation.py"
+      - ".github/workflows/crypto-research.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-research-main
+  cancel-in-progress: true
+
+jobs:
+  crypto-research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+      ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest
+
+      - name: Run repository tests
+        run: pytest -q
+
+      - name: Run V5 safety self-test
+        run: python scripts/crypto_v5_ci.py --self-test
+
+      - name: Verify Alpaca paper secrets are present
+        shell: bash
+        run: |
+          test -n "$ALPACA_PAPER_API_KEY" || (echo "ALPACA_PAPER_API_KEY is missing" && exit 1)
+          test -n "$ALPACA_PAPER_SECRET_KEY" || (echo "ALPACA_PAPER_SECRET_KEY is missing" && exit 1)
+          echo "Alpaca PAPER secrets are present."
+
+      - name: Run Crypto V5 research
+        run: python scripts/crypto_v5_ci.py
+
+      - name: Upload research pack
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CryptoRotationV5-research-pack
+          path: |
+            CryptoRotationV5_research_pack/
+            CryptoRotationV5_research_pack.zip
+          if-no-files-found: warn
+          retention-days: 30
