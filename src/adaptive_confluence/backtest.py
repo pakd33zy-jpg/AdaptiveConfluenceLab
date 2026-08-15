@@ -24,6 +24,23 @@ def _slip(price: float, side: int, bps: float) -> float:
     return price * (1 + side * bps / 10_000.0)
 
 
+def _bucket_stats(frame: pd.DataFrame) -> dict:
+    if frame.empty:
+        return {"trades": 0, "net_pnl": 0.0, "win_rate_pct": 0.0, "profit_factor": 0.0, "expectancy": 0.0}
+    wins = frame.loc[frame.net_pnl > 0, "net_pnl"]
+    losses = frame.loc[frame.net_pnl < 0, "net_pnl"]
+    gross_win = float(wins.sum())
+    gross_loss = float(-losses.sum())
+    pf = gross_win / gross_loss if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0)
+    return {
+        "trades": int(len(frame)),
+        "net_pnl": float(frame.net_pnl.sum()),
+        "win_rate_pct": float(100 * (frame.net_pnl > 0).mean()),
+        "profit_factor": float(pf),
+        "expectancy": float(frame.net_pnl.mean()),
+    }
+
+
 def run_backtest(
     raw: pd.DataFrame,
     strategy_cfg: StrategyConfig | None = None,
@@ -33,45 +50,51 @@ def run_backtest(
 ) -> BacktestResult:
     sc = strategy_cfg or StrategyConfig()
     bc = bt_cfg or BacktestConfig()
-    # Risk-only parameter sweeps can reuse an already-built indicator/signal
-    # frame instead of recalculating 30+ indicators for every combination.
     df = precomputed_features if precomputed_features is not None else compute_features(raw, sc)
+
+    # Pull frequently accessed columns into NumPy arrays. V1 used df.iloc in the
+    # inner loop, which dominated the runtime on multi-year 5-minute data.
+    idx = df.index
+    opens = df["open"].to_numpy(float)
+    highs = df["high"].to_numpy(float)
+    lows = df["low"].to_numpy(float)
+    closes = df["close"].to_numpy(float)
+    atrs = df["atr14"].to_numpy(float)
+    signals = df["signal"].to_numpy(int)
+    setups = df["setup"].astype(str).to_numpy()
+    scores = df["direction_score"].to_numpy(float)
 
     cash = bc.initial_capital
     equity = bc.initial_capital
     position = None
     trades = []
-    equity_curve = []
+    eq_times = []
+    eq_values = []
     daily_start_equity = equity
     current_day = None
     trades_today = 0
     last_entry_i = -10_000
 
     for i in range(1, len(df)):
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
-        ts = df.index[i]
+        ts = idx[i]
         day = ts.date() if hasattr(ts, "date") else None
         if day != current_day:
             current_day = day
             daily_start_equity = equity
             trades_today = 0
 
-        # Mark-to-market.
-        if position:
-            direction = position["direction"]
-            equity = cash + direction * position["qty"] * (row.close - position["entry_price"])
+        if position is not None:
+            d = position["direction"]
+            equity = cash + d * position["qty"] * (closes[i] - position["entry_price"])
         else:
             equity = cash
 
-        day_pnl_pct = 100 * (equity - daily_start_equity) / daily_start_equity if daily_start_equity else 0
+        day_pnl_pct = 100 * (equity - daily_start_equity) / daily_start_equity if daily_start_equity else 0.0
 
-        # Exit management. Use current OHLC; if stop and target both touch in one
-        # bar, conservative mode assumes the stop happened first.
-        if position:
+        if position is not None:
             d = position["direction"]
-            position["best_high"] = max(position["best_high"], row.high)
-            position["best_low"] = min(position["best_low"], row.low)
+            position["best_high"] = max(position["best_high"], highs[i])
+            position["best_low"] = min(position["best_low"], lows[i])
             entry = position["entry_price"]
             stop_dist = position["stop_dist"]
             target_r = position["target_r"]
@@ -81,12 +104,12 @@ def run_backtest(
                 initial_stop = entry - stop_dist
                 target = entry + stop_dist * target_r
                 if position["best_high"] >= entry + stop_dist * sc.trail_activate_r:
-                    trail = position["best_high"] - row.atr14 * sc.trail_atr
+                    trail = position["best_high"] - atrs[i] * sc.trail_atr
                     stop = max(initial_stop, entry, trail)
                 else:
                     stop = initial_stop
-                hit_stop = row.low <= stop
-                hit_target = row.high >= target
+                hit_stop = lows[i] <= stop
+                hit_target = highs[i] >= target
                 exit_reason = None
                 exit_price = None
                 if hit_stop and hit_target:
@@ -97,17 +120,17 @@ def run_backtest(
                 elif hit_target:
                     exit_reason, exit_price = "TARGET", target
                 elif age >= sc.max_hold_bars:
-                    exit_reason, exit_price = "TIME", row.close
+                    exit_reason, exit_price = "TIME", closes[i]
             else:
                 initial_stop = entry + stop_dist
                 target = entry - stop_dist * target_r
                 if position["best_low"] <= entry - stop_dist * sc.trail_activate_r:
-                    trail = position["best_low"] + row.atr14 * sc.trail_atr
+                    trail = position["best_low"] + atrs[i] * sc.trail_atr
                     stop = min(initial_stop, entry, trail)
                 else:
                     stop = initial_stop
-                hit_stop = row.high >= stop
-                hit_target = row.low <= target
+                hit_stop = highs[i] >= stop
+                hit_target = lows[i] <= target
                 exit_reason = None
                 exit_price = None
                 if hit_stop and hit_target:
@@ -118,10 +141,10 @@ def run_backtest(
                 elif hit_target:
                     exit_reason, exit_price = "TARGET", target
                 elif age >= sc.max_hold_bars:
-                    exit_reason, exit_price = "TIME", row.close
+                    exit_reason, exit_price = "TIME", closes[i]
 
             if exit_price is not None:
-                px = _slip(exit_price, -d, bc.slippage_bps)
+                px = _slip(float(exit_price), -d, bc.slippage_bps)
                 gross = d * position["qty"] * (px - entry)
                 exit_commission = abs(position["qty"] * px) * bc.commission_pct / 100
                 net = gross - position["entry_commission"] - exit_commission
@@ -133,21 +156,24 @@ def run_backtest(
                     "exit_reason": exit_reason,
                     "gross_pnl": gross,
                     "net_pnl": net,
-                    "r_multiple": net / position["risk_cash"] if position["risk_cash"] else 0,
+                    "r_multiple": net / position["risk_cash"] if position["risk_cash"] else 0.0,
                 })
                 position = None
                 equity = cash
 
-        # Signal from previous close -> current open entry. This avoids using the
-        # close that generated a signal as if we already knew it intrabar.
-        if position is None and prev.signal != 0:
-            if trades_today < sc.max_trades_per_day and day_pnl_pct > -sc.daily_loss_limit_pct and (i - last_entry_i) > 3:
-                d = int(prev.signal)
-                setup = str(prev.setup)
+        # Signal is from previous completed close; fill is current open.
+        if position is None and signals[i - 1] != 0:
+            if (
+                trades_today < sc.max_trades_per_day
+                and day_pnl_pct > -sc.daily_loss_limit_pct
+                and (i - last_entry_i) > sc.cooldown_bars
+            ):
+                d = int(signals[i - 1])
+                setup = str(setups[i - 1])
                 stop_mult, target_r = setup_risk(sc, setup)
-                atr_val = float(prev.atr14)
+                atr_val = float(atrs[i - 1])
                 if math.isfinite(atr_val) and atr_val > 0:
-                    entry = _slip(float(row.open), d, bc.slippage_bps)
+                    entry = _slip(float(opens[i]), d, bc.slippage_bps)
                     stop_dist = atr_val * stop_mult
                     risk_cash = equity * sc.risk_pct / 100
                     risk_qty = risk_cash / stop_dist
@@ -168,40 +194,74 @@ def run_backtest(
                             "target_r": target_r,
                             "risk_cash": risk_cash,
                             "entry_commission": entry_commission,
-                            "best_high": float(row.high),
-                            "best_low": float(row.low),
-                            "score": float(prev.direction_score),
+                            "best_high": float(highs[i]),
+                            "best_low": float(lows[i]),
+                            "score": float(scores[i - 1]),
                         }
                         trades_today += 1
                         last_entry_i = i
 
-        equity_curve.append((ts, equity))
+        eq_times.append(ts)
+        eq_values.append(equity)
 
-    eq = pd.Series({t: e for t, e in equity_curve}).sort_index()
+    # Realize any position still open at the end of the dataset so the final
+    # equity and trade statistics do not silently ignore an unfinished trade.
+    if position is not None and len(df):
+        d = position["direction"]
+        px = _slip(float(closes[-1]), -d, bc.slippage_bps)
+        gross = d * position["qty"] * (px - position["entry_price"])
+        exit_commission = abs(position["qty"] * px) * bc.commission_pct / 100
+        net = gross - position["entry_commission"] - exit_commission
+        cash += net
+        trades.append({
+            **position,
+            "exit_time": idx[-1],
+            "exit_price": px,
+            "exit_reason": "END_OF_DATA",
+            "gross_pnl": gross,
+            "net_pnl": net,
+            "r_multiple": net / position["risk_cash"] if position["risk_cash"] else 0.0,
+        })
+        equity = cash
+        if eq_values:
+            eq_values[-1] = cash
+
+    eq = pd.Series(eq_values, index=eq_times, dtype=float).sort_index()
     ret = eq.pct_change().fillna(0)
     peak = eq.cummax()
     dd = (eq / peak - 1) * 100
     trade_df = pd.DataFrame(trades)
     net_pnl = cash - bc.initial_capital
-    wins = trade_df[trade_df.net_pnl > 0] if not trade_df.empty else trade_df
-    losses = trade_df[trade_df.net_pnl < 0] if not trade_df.empty else trade_df
-    gross_win = wins.net_pnl.sum() if not trade_df.empty else 0.0
-    gross_loss = -losses.net_pnl.sum() if not trade_df.empty else 0.0
-    pf = gross_win / gross_loss if gross_loss > 0 else (np.inf if gross_win > 0 else 0.0)
+
+    base = _bucket_stats(trade_df)
     sharpe = np.sqrt(252 * 78) * ret.mean() / ret.std(ddof=0) if ret.std(ddof=0) > 0 else 0.0
+
+    by_setup = {}
+    by_direction = {}
+    by_exit_reason = {}
+    if not trade_df.empty:
+        for name, group in trade_df.groupby("setup"):
+            by_setup[str(name)] = _bucket_stats(group)
+        for d, group in trade_df.groupby("direction"):
+            by_direction["LONG" if int(d) > 0 else "SHORT"] = _bucket_stats(group)
+        for reason, group in trade_df.groupby("exit_reason"):
+            by_exit_reason[str(reason)] = _bucket_stats(group)
 
     stats = {
         "initial_capital": bc.initial_capital,
         "ending_equity": cash,
         "net_pnl": net_pnl,
         "return_pct": 100 * net_pnl / bc.initial_capital,
-        "trades": int(len(trade_df)),
+        "trades": base["trades"],
         "wins": int((trade_df.net_pnl > 0).sum()) if not trade_df.empty else 0,
         "losses": int((trade_df.net_pnl < 0).sum()) if not trade_df.empty else 0,
-        "win_rate_pct": float(100 * (trade_df.net_pnl > 0).mean()) if not trade_df.empty else 0.0,
-        "profit_factor": float(pf),
-        "expectancy": float(trade_df.net_pnl.mean()) if not trade_df.empty else 0.0,
+        "win_rate_pct": base["win_rate_pct"],
+        "profit_factor": base["profit_factor"],
+        "expectancy": base["expectancy"],
         "max_drawdown_pct": float(dd.min()) if len(dd) else 0.0,
         "sharpe_approx": float(sharpe),
+        "by_setup": by_setup,
+        "by_direction": by_direction,
+        "by_exit_reason": by_exit_reason,
     }
     return BacktestResult(stats=stats, trades=trade_df, equity_curve=eq, features=df)

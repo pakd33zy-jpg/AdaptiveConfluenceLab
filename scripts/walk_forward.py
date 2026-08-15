@@ -12,15 +12,21 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from adaptive_confluence import BacktestConfig, StrategyConfig, compute_features, run_backtest
+from adaptive_confluence import BacktestConfig, StrategyConfig, run_backtest
 
 
 def score(stats):
-    # Reward return and profit factor, penalize drawdown. Require some activity.
-    if stats["trades"] < 8:
+    # Do not reward a configuration with too few trades. Profit factor and
+    # expectancy matter more than raw return during selection.
+    if stats["trades"] < 20:
         return -1e9
-    pf = min(stats["profit_factor"], 5.0) if stats["profit_factor"] != float("inf") else 5.0
-    return stats["return_pct"] + 3.0 * pf + stats["max_drawdown_pct"] * 1.5
+    pf = min(float(stats["profit_factor"]), 3.0)
+    return (
+        float(stats["return_pct"]) * 1.0
+        + pf * 2.0
+        + float(stats["max_drawdown_pct"]) * 1.25
+        + (0.5 if float(stats["expectancy"]) > 0 else -0.5)
+    )
 
 
 def fmt_duration(seconds: float) -> str:
@@ -35,7 +41,7 @@ def fmt_duration(seconds: float) -> str:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Simple chronological walk-forward robustness sweep")
+    p = argparse.ArgumentParser(description="V2 compact chronological walk-forward sweep")
     p.add_argument("csv")
     p.add_argument("--out", default="walk_forward.json")
     args = p.parse_args()
@@ -46,94 +52,56 @@ def main():
         df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
         df = df.dropna(subset=[time_col]).set_index(time_col).sort_index()
 
-    n = len(df)
-    split = int(n * 0.70)
+    split = int(len(df) * 0.70)
     train, test = df.iloc[:split], df.iloc[split:]
 
-    thresholds = [0.24, 0.28, 0.32]
-    adx_values = [20.0, 22.0, 24.0]
-    stop_values = [1.1, 1.2, 1.35]
-    target_values = [2.0, 2.4, 2.8]
-    total = len(thresholds) * len(adx_values) * len(stop_values) * len(target_values)
+    # V2 deliberately uses a compact grid. The goal is robustness, not finding
+    # one lucky point in an 81-cell search.
+    grid = list(itertools.product(
+        [20.0, 24.0],          # ADX
+        [0.90, 1.05],          # pullback relative volume
+        [1.20, 1.40],          # breakout relative volume
+        [1.20, 1.40],          # breakout stop ATR
+        [2.0, 2.4],            # breakout target R
+    ))
 
     rows = []
-    completed = 0
     started = time.perf_counter()
     bt_cfg = BacktestConfig()
+    total = len(grid)
+    print(f"V2 walk-forward: {len(train):,} train / {len(test):,} test bars; {total} configs", flush=True)
 
-    print(
-        f"Walk-forward: {len(train):,} train bars / {len(test):,} untouched test bars; "
-        f"{total} parameter combinations.",
-        flush=True,
-    )
-
-    # Only threshold and ADX change the signal frame in this grid. The stop and
-    # target values change trade management only, so each expensive feature
-    # build is reused for all nine stop/target combinations.
-    for threshold, adx_min in itertools.product(thresholds, adx_values):
-        feature_started = time.perf_counter()
-        signal_cfg = StrategyConfig(
-            score_threshold=threshold,
-            trend_adx_min=adx_min,
+    for n, (adx, min_rv, breakout_rv, stop_atr, target_r) in enumerate(grid, 1):
+        cfg = StrategyConfig(
+            trend_adx_min=adx,
+            min_relative_volume=min_rv,
+            breakout_relative_volume=breakout_rv,
+            breakout_stop_atr=stop_atr,
+            breakout_target_r=target_r,
         )
+        stats = run_backtest(train, cfg, bt_cfg)["stats"]
+        rows.append((score(stats), cfg, stats))
+        elapsed = time.perf_counter() - started
+        eta = elapsed / n * (total - n)
         print(
-            f"Building features for threshold={threshold:.2f}, ADX={adx_min:.0f} ...",
+            f"[{n:02d}/{total}] adx={adx:.0f} rv={min_rv:.2f}/{breakout_rv:.2f} "
+            f"stop={stop_atr:.2f} target={target_r:.1f} | "
+            f"ret={stats['return_pct']:.3f}% PF={stats['profit_factor']:.2f} "
+            f"trades={stats['trades']} | ETA {fmt_duration(eta)}",
             flush=True,
         )
-        features = compute_features(train, signal_cfg)
-        print(
-            f"  features ready in {fmt_duration(time.perf_counter() - feature_started)}",
-            flush=True,
-        )
-
-        for stop_atr, target_r in itertools.product(stop_values, target_values):
-            cfg = StrategyConfig(
-                score_threshold=threshold,
-                trend_adx_min=adx_min,
-                breakout_stop_atr=stop_atr,
-                breakout_target_r=target_r,
-            )
-            train_stats = run_backtest(
-                train,
-                cfg,
-                bt_cfg,
-                precomputed_features=features,
-            )["stats"]
-            rows.append((score(train_stats), cfg, train_stats))
-            completed += 1
-
-            elapsed = time.perf_counter() - started
-            eta = (elapsed / completed) * (total - completed) if completed else 0
-            print(
-                f"[{completed:02d}/{total}] "
-                f"thr={threshold:.2f} adx={adx_min:.0f} stop={stop_atr:.2f} target={target_r:.1f} | "
-                f"return={train_stats['return_pct']:.3f}% "
-                f"PF={train_stats['profit_factor']:.2f} "
-                f"trades={train_stats['trades']} | "
-                f"elapsed {fmt_duration(elapsed)} ETA {fmt_duration(eta)}",
-                flush=True,
-            )
-
-        del features
 
     rows.sort(key=lambda x: x[0], reverse=True)
     best = rows[0][1]
-
-    print("Running best configuration on untouched 30% test set ...", flush=True)
-    test_features = compute_features(test, best)
-    test_stats = run_backtest(
-        test,
-        best,
-        bt_cfg,
-        precomputed_features=test_features,
-    )["stats"]
-
+    test_stats = run_backtest(test, best, bt_cfg)["stats"]
     output = {
+        "strategy_version": "V2 trend+breakout",
         "method": "70% chronological train / 30% untouched test",
+        "tested_configs": total,
         "best_train_config": best.to_dict(),
         "best_train_stats": rows[0][2],
         "out_of_sample_test_stats": test_stats,
-        "warning": "Do not deploy from one split. Repeat across symbols, regimes, and dates; then forward-test in paper.",
+        "warning": "A positive backtest is not proof of future profitability. Repeat across symbols/regimes and paper-forward-test.",
     }
     Path(args.out).write_text(json.dumps(output, indent=2, default=str))
     print(f"Finished in {fmt_duration(time.perf_counter() - started)}", flush=True)

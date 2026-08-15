@@ -1,14 +1,13 @@
 {
-  "score_threshold": 0.28,
+  "strategy_version": "V2 trend+breakout",
   "trend_adx_min": 22.0,
-  "range_adx_max": 19.0,
-  "trend_chop_max": 55.0,
-  "range_chop_min": 57.0,
-  "min_relative_volume": 0.85,
-  "breakout_relative_volume": 1.15,
-  "max_atr_pct": 2.5,
-  "risk_pct": 0.5,
-  "max_position_pct": 25.0,
-  "daily_loss_limit_pct": 2.0,
-  "max_trades_per_day": 8
+  "min_relative_volume": 0.9,
+  "breakout_relative_volume": 1.25,
+  "min_atr_pct": 0.05,
+  "max_atr_pct": 1.5,
+  "risk_pct": 0.25,
+  "max_position_pct": 20.0,
+  "daily_loss_limit_pct": 1.0,
+  "max_trades_per_day": 4,
+  "cooldown_bars": 6
 }
