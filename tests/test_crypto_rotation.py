@@ -112,3 +112,8 @@ def test_chronological_splits_do_not_overlap():
     assert val[1] < hold[0]
     assert train[0] == dates[0]
     assert hold[1] == dates[-1]
+
+
+def test_v2_excludes_usdg_and_uses_relative_liquidity():
+    assert "USDG" in mod.EXCLUDED_BASES
+    assert mod.DEFAULT_MIN_MEDIAN_DOLLAR_VOLUME == 0.0

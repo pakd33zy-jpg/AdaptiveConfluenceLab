@@ -48,12 +48,13 @@ DEFAULT_END = None
 # Avoid stablecoin / cash-like bases that can distort a momentum ranking.
 EXCLUDED_BASES = {
     "USD", "USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "USDP",
+    "USDG", "GUSD", "USDS", "USDE", "EURC", "USD0", "USDY",
 }
 
 # The active universe can be larger; this is only the maximum number of liquid
 # assets admitted to the momentum ranking on each rebalance date.
 DEFAULT_MAX_LIQUID_ASSETS = 15
-DEFAULT_MIN_MEDIAN_DOLLAR_VOLUME = 250_000.0
+DEFAULT_MIN_MEDIAN_DOLLAR_VOLUME = 0.0
 LIQUIDITY_LOOKBACK = 30
 
 INITIAL_EQUITY = 100_000.0
@@ -69,7 +70,7 @@ MAX_SMA = max(SMA_GRID)
 MAX_MOM = max(MOMENTUM_GRID)
 WARMUP_DAYS = max(MAX_SMA, MAX_MOM + 1, LIQUIDITY_LOOKBACK + 1)
 
-PACK_DIRNAME = "CryptoRotation_research_pack"
+PACK_DIRNAME = "CryptoRotationV2_research_pack"
 
 
 @dataclass(frozen=True)
@@ -325,7 +326,7 @@ def target_weights(
 
         if not all(math.isfinite(x) for x in (close, mom, avg, liq)):
             continue
-        if liq < config.min_median_dollar_volume:
+        if liq <= 0 or liq < config.min_median_dollar_volume:
             continue
         candidates.append((symbol, liq, mom, close, avg))
 
@@ -1165,7 +1166,7 @@ def main() -> int:
 
     summary = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "strategy": "CRYPTO_ROTATION_V1_RESEARCH",
+        "strategy": "CRYPTO_ROTATION_V2_RESEARCH",
         "research_only": True,
         "orders_placed": False,
         "status": status,
@@ -1202,6 +1203,7 @@ def main() -> int:
             "liquidity_lookback_days": LIQUIDITY_LOOKBACK,
             "max_liquid_assets_per_rebalance": DEFAULT_MAX_LIQUID_ASSETS,
             "minimum_trailing_median_dollar_volume": DEFAULT_MIN_MEDIAN_DOLLAR_VOLUME,
+            "liquidity_policy": "Rank by trailing 30-day median Alpaca-feed dollar volume; no fixed dollar floor.",
             "holdout_policy": (
                 "Train grid -> validation shortlist -> one final holdout inspection "
                 "for the selected configuration."
