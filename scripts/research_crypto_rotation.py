@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-Crypto Rotation V3 Research Harness for AdaptiveConfluenceLab.
+Crypto Rotation V4 Research Harness for AdaptiveConfluenceLab.
 
-V3 corrections and research changes
+V4 corrections and research changes
 -----------------------------------
-- No trading before the common evaluation start. Initial evaluation equity is
-  exactly $100,000; indicator history before that date is used only as warmup.
-- Relative liquidity ranking (top 15 by trailing 30-day median dollar volume).
-- Stablecoin/cash-like bases excluded from the risk-asset ranking.
-- BTC regime-controlled exposure and BTC-volatility-scaled exposure.
-- Compact 288-configuration grid focused on diversified top-3/top-4 portfolios.
-- Chronological train/validation selection with robustness scoring.
-- The previously viewed V2 holdout is retained only as a historical diagnostic;
-  it is NOT described as unseen validation for V3.
-- 1x/2x/3x transaction-cost stress.
+- Preserve V3's corrected $100,000 evaluation anchor and zero pre-evaluation trades.
+- Reduce sideways/risk-off exposure further: strict profile is all-cash outside BTC-up.
+- Require broad participation: at least four liquid crypto assets must pass momentum/trend.
+- Lower volatility targets and longer momentum/trend windows to reduce churn and whipsaw.
+- Select across four chronological development folds using worst-fold robustness.
+- Keep the already-viewed final historical segment diagnostic only; it is not unseen.
+- Stronger drawdown penalties and 1x/2x/3x transaction-cost stress.
 - Long/cash only. RESEARCH ONLY. Never places orders.
 """
 from __future__ import annotations
@@ -50,28 +47,29 @@ LIQUIDITY_LOOKBACK = 30
 DEFAULT_MAX_LIQUID_ASSETS = 15
 DEFAULT_MIN_MEDIAN_DOLLAR_VOLUME = 0.0
 
-MOMENTUM_GRID = (42, 63, 90)
-SMA_GRID = (100, 150, 200)
-REBALANCE_GRID = (5, 7)
+MOMENTUM_GRID = (63, 90, 120)
+SMA_GRID = (150, 200)
+REBALANCE_GRID = (7, 10)
 TOP_K_GRID = (3, 4)
 WEIGHTING_GRID = ("equal", "rank")
-REGIME_PROFILE_GRID = ("defensive", "balanced")
-VOL_TARGET_GRID = (45.0, 65.0)
+REGIME_PROFILE_GRID = ("strict", "defensive")
+VOL_TARGET_GRID = (35.0, 45.0, 55.0)
 
 REGIME_PROFILES = {
-    # Sideways was V2's major failure mode, so risk is deliberately reduced.
-    "defensive": {"up": 1.00, "sideways": 0.20, "down": 0.00},
-    "balanced": {"up": 1.00, "sideways": 0.40, "down": 0.10},
+    # V3 still lost heavily in sideways conditions. V4 treats cash as the default.
+    "strict": {"up": 0.85, "sideways": 0.00, "down": 0.00},
+    "defensive": {"up": 1.00, "sideways": 0.10, "down": 0.00},
 }
 
-BTC_REGIME_SMA_DAYS = 100
+BTC_REGIME_SMA_DAYS = 150
 BTC_REGIME_MOM_DAYS = 30
 BTC_REGIME_MOM_THRESHOLD = 0.05
 BTC_VOL_LOOKBACK = 20
+MIN_ELIGIBLE_BREADTH = 4
 MAX_SMA = max(max(SMA_GRID), BTC_REGIME_SMA_DAYS)
 MAX_MOM = max(max(MOMENTUM_GRID), BTC_REGIME_MOM_DAYS)
 WARMUP_DAYS = max(MAX_SMA, MAX_MOM + 1, LIQUIDITY_LOOKBACK + 1, BTC_VOL_LOOKBACK + 2)
-PACK_DIRNAME = "CryptoRotationV3_research_pack"
+PACK_DIRNAME = "CryptoRotationV4_research_pack"
 
 
 @dataclass(frozen=True)
@@ -114,8 +112,10 @@ class BacktestResult:
 
 
 def credentials() -> Tuple[str, str]:
-    key = os.getenv("ALPACA_PAPER_API_KEY") or os.getenv("ALPACA_API_KEY")
-    secret = os.getenv("ALPACA_PAPER_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
+    key = os.getenv("ALPACA_PAPER_API_KEY") or os.getenv("ALPACA_API_KEY") or ""
+    secret = os.getenv("ALPACA_PAPER_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY") or ""
+    key = re.sub(r"\\s+", "", key)
+    secret = re.sub(r"\\s+", "", secret)
     if not key or not secret:
         raise SystemExit(
             "Alpaca credentials are missing in this PowerShell session.\n"
@@ -369,12 +369,12 @@ def target_weights(matrices: MarketMatrices, signal_index: int, config: CryptoCo
     # Top relative-liquidity assets only, using signal-date data.
     idx = idx[np.argsort(liq[idx])[::-1][:config.max_liquid_assets]]
     eligible = idx[(mom[idx] > 0.0) & (close[idx] > avg[idx])]
-    if eligible.size:
-        eligible = eligible[np.argsort(mom[eligible])[::-1][:config.top_k]]
 
     exposure, regime, vol = exposure_for_signal(matrices, signal_index, config)
-    if eligible.size == 0 or exposure <= 0:
+    if eligible.size < MIN_ELIGIBLE_BREADTH or exposure <= 0:
         return weights, regime, vol, exposure
+
+    eligible = eligible[np.argsort(mom[eligible])[::-1][:config.top_k]]
 
     if config.weighting == "equal":
         weights[eligible] = exposure / eligible.size
@@ -574,20 +574,24 @@ def metric_score(metrics: Mapping[str, float]) -> float:
         pf_term = 1.25
     else:
         pf_term = -1.0
-    return 1.8 * cagr + 0.40 * (win - 0.50) + 0.55 * pf_term - 1.50 * dd
+    return 1.5 * cagr + 0.40 * (win - 0.50) + 0.55 * pf_term - 2.25 * dd
 
 
-def chronological_splits(eval_dates: pd.DatetimeIndex):
-    if len(eval_dates) < 300:
-        raise ValueError("Need at least 300 evaluation dates.")
+def development_splits(eval_dates: pd.DatetimeIndex):
+    if len(eval_dates) < 400:
+        raise ValueError("Need at least 400 evaluation dates.")
     n = len(eval_dates)
-    train_end = max(1, int(n * 0.60) - 1)
-    val_end = max(train_end + 1, int(n * 0.80) - 1)
-    return (
-        (eval_dates[0], eval_dates[train_end]),
-        (eval_dates[train_end + 1], eval_dates[val_end]),
-        (eval_dates[val_end + 1], eval_dates[-1]),
-    )
+    dev_n = max(4, int(n * 0.80))
+    diagnostic = (eval_dates[dev_n], eval_dates[-1])
+    bounds = np.linspace(0, dev_n, 5, dtype=int)
+    folds = []
+    for k in range(4):
+        a = int(bounds[k])
+        b = int(bounds[k + 1]) - 1
+        if b <= a:
+            raise ValueError("Development fold is too short.")
+        folds.append((eval_dates[a], eval_dates[b]))
+    return folds, diagnostic
 
 
 def config_from_row(row: Mapping) -> CryptoConfig:
@@ -606,7 +610,7 @@ def config_from_row(row: Mapping) -> CryptoConfig:
 
 
 def evaluate_grid(matrices: MarketMatrices, trade_start_index: int, eval_dates: pd.DatetimeIndex):
-    train, validation, diagnostic = chronological_splits(eval_dates)
+    folds, diagnostic = development_splits(eval_dates)
     configs = [
         CryptoConfig(mom, sma, reb, top_k, weighting, profile, vol_target)
         for mom, sma, reb, top_k, weighting, profile, vol_target in itertools.product(
@@ -614,86 +618,93 @@ def evaluate_grid(matrices: MarketMatrices, trade_start_index: int, eval_dates: 
             WEIGHTING_GRID, REGIME_PROFILE_GRID, VOL_TARGET_GRID,
         )
     ]
-    print(f"Testing {len(configs)} Crypto V3 configurations...")
+    print(f"Testing {len(configs)} Crypto V4 configurations...")
     cache: Dict[CryptoConfig, BacktestResult] = {}
-    train_rows = []
+    rows = []
+
     for index, config in enumerate(configs, start=1):
         result = run_backtest(matrices, config, trade_start_index=trade_start_index)
         cache[config] = result
-        met = segment_metrics(result, *train)
-        train_rows.append({
-            **asdict(config),
-            **{f"train_{k}": v for k, v in met.items()},
-            "train_score": metric_score(met),
-        })
+        fold_metrics = [segment_metrics(result, *fold) for fold in folds]
+        fold_scores = [metric_score(m) for m in fold_metrics]
+        cagrs = np.array([float(m["cagr_pct"]) for m in fold_metrics], dtype=float)
+        worst_score = float(min(fold_scores))
+        mean_score = float(np.mean(fold_scores))
+        cagr_dispersion = float(np.std(cagrs) / 100.0)
+        robust_score = worst_score + 0.40 * mean_score - 0.30 * cagr_dispersion
+
+        row = {**asdict(config)}
+        for k, met in enumerate(fold_metrics, start=1):
+            for name, value in met.items():
+                row[f"fold{k}_{name}"] = value
+            row[f"fold{k}_score"] = fold_scores[k - 1]
+        row["worst_fold_score"] = worst_score
+        row["mean_fold_score"] = mean_score
+        row["cagr_dispersion"] = cagr_dispersion
+        row["robust_score"] = robust_score
+        rows.append(row)
+
         if index % 12 == 0 or index == len(configs):
             print(f"  grid progress: {index}/{len(configs)}")
 
-    train_df = pd.DataFrame(train_rows).sort_values(
-        ["train_score", "train_return_pct"], ascending=False
+    grid_df = pd.DataFrame(rows).sort_values(
+        ["robust_score", "worst_fold_score"], ascending=False
     ).reset_index(drop=True)
 
-    shortlist = train_df.head(24).copy()
-    rows = []
-    for _, row in shortlist.iterrows():
-        config = config_from_row(row)
-        result = cache[config]
-        val = segment_metrics(result, *validation)
-        tscore = float(row["train_score"])
-        vscore = metric_score(val)
-        train_cagr = float(row["train_cagr_pct"])
-        val_cagr = float(val["cagr_pct"])
-        divergence_penalty = min(2.0, abs(train_cagr - val_cagr) / 100.0)
-        robust_score = min(tscore, vscore) + 0.25 * ((tscore + vscore) / 2.0) - 0.35 * divergence_penalty
-        rows.append({
-            **asdict(config),
-            **{f"train_{k}": row[f"train_{k}"] for k in (
-                "return_pct", "cagr_pct", "max_drawdown_pct", "sharpe",
-                "cycles", "win_rate_pct", "profit_factor",
-            )},
-            "train_score": tscore,
-            **{f"validation_{k}": v for k, v in val.items()},
-            "validation_score": vscore,
-            "robust_score": robust_score,
-        })
+    eligible = grid_df.copy()
+    for k in range(1, 5):
+        eligible = eligible[
+            (eligible[f"fold{k}_return_pct"] > 0)
+            & (eligible[f"fold{k}_profit_factor"] > 1.0)
+            & (eligible[f"fold{k}_max_drawdown_pct"] > -30.0)
+            & (eligible[f"fold{k}_cycles"] >= 8)
+        ]
 
-    val_df = pd.DataFrame(rows)
-    eligible = val_df[
-        (val_df["train_return_pct"] > 0)
-        & (val_df["validation_return_pct"] > 0)
-        & (val_df["train_profit_factor"] > 1.0)
-        & (val_df["validation_profit_factor"] > 1.0)
-        & (val_df["train_max_drawdown_pct"] > -45.0)
-        & (val_df["validation_max_drawdown_pct"] > -45.0)
-        & (val_df["train_cycles"] >= 12)
-        & (val_df["validation_cycles"] >= 8)
-    ].copy()
-    pool = eligible if not eligible.empty else val_df
-    pool = pool.sort_values(["robust_score", "validation_score"], ascending=False).reset_index(drop=True)
+    pool = eligible if not eligible.empty else grid_df
+    pool = pool.sort_values(
+        ["robust_score", "worst_fold_score"], ascending=False
+    ).reset_index(drop=True)
+
     chosen_row = pool.iloc[0].to_dict()
     chosen = config_from_row(chosen_row)
     result = cache[chosen]
     diagnostic_metrics = segment_metrics(result, *diagnostic)
     full_metrics = segment_metrics(result, eval_dates[0], eval_dates[-1])
 
+    development = []
+    for k, fold in enumerate(folds, start=1):
+        development.append({
+            "fold": k,
+            "start": fold[0].isoformat(),
+            "end": fold[1].isoformat(),
+            **{
+                name: chosen_row[f"fold{k}_{name}"]
+                for name in (
+                    "return_pct", "cagr_pct", "max_drawdown_pct", "sharpe",
+                    "cycles", "win_rate_pct", "profit_factor",
+                )
+            },
+            "score": float(chosen_row[f"fold{k}_score"]),
+        })
+
     report = {
         "config": asdict(chosen),
-        "train": {k.replace("train_", ""): chosen_row[k] for k in chosen_row if k.startswith("train_") and k != "train_score"},
-        "validation": {k.replace("validation_", ""): chosen_row[k] for k in chosen_row if k.startswith("validation_") and k != "validation_score"},
+        "development_folds": development,
         "historical_diagnostic": diagnostic_metrics,
         "full": full_metrics,
-        "train_score": float(chosen_row["train_score"]),
-        "validation_score": float(chosen_row["validation_score"]),
+        "worst_fold_score": float(chosen_row["worst_fold_score"]),
+        "mean_fold_score": float(chosen_row["mean_fold_score"]),
+        "cagr_dispersion": float(chosen_row["cagr_dispersion"]),
         "robust_score": float(chosen_row["robust_score"]),
-        "eligible_robust_shortlist_count": int(len(eligible)),
-        "shortlist_size": int(len(val_df)),
-        "splits": {
-            "train": [train[0].isoformat(), train[1].isoformat()],
-            "validation": [validation[0].isoformat(), validation[1].isoformat()],
-            "historical_diagnostic_not_unseen": [diagnostic[0].isoformat(), diagnostic[1].isoformat()],
-        },
+        "eligible_development_count": int(len(eligible)),
+        "grid_size": int(len(grid_df)),
+        "historical_diagnostic_not_unseen": [
+            diagnostic[0].isoformat(), diagnostic[1].isoformat()
+        ],
     }
-    return train_df, val_df, report, result
+
+    shortlist = grid_df.head(24).copy()
+    return grid_df, shortlist, report, result
 
 
 def benchmark_btc(matrices: MarketMatrices, start: pd.Timestamp, end: pd.Timestamp) -> dict:
@@ -757,41 +768,50 @@ def stress_costs(matrices: MarketMatrices, config: CryptoConfig, trade_start_ind
 
 
 def candidate_status(report: Mapping, stress: Sequence[Mapping]) -> str:
-    train = report["train"]
-    val = report["validation"]
+    folds = report["development_folds"]
     diag = report["historical_diagnostic"]
     full = report["full"]
-    def positive(seg: Mapping, min_cycles: int) -> bool:
-        return (
-            float(seg.get("return_pct", 0)) > 0
-            and float(seg.get("profit_factor", 0)) > 1.0
-            and int(seg.get("cycles", 0)) >= min_cycles
-        )
-    double = next((x for x in stress if float(x["cost_multiplier"]) == 2.0), None)
-    robust = (
-        positive(train, 12)
-        and positive(val, 8)
-        and positive(diag, 8)
-        and float(train.get("max_drawdown_pct", -100)) > -40
-        and float(val.get("max_drawdown_pct", -100)) > -40
-        and float(diag.get("max_drawdown_pct", -100)) > -40
-        and float(full.get("max_drawdown_pct", -100)) > -35
-        and double is not None
-        and float(double.get("return_pct", 0)) > 0
-        and float(double.get("max_drawdown_pct", -100)) > -40
+
+    dev_ok = all(
+        float(f.get("return_pct", 0)) > 0
+        and float(f.get("profit_factor", 0)) > 1.0
+        and float(f.get("max_drawdown_pct", -100)) > -30.0
+        and int(f.get("cycles", 0)) >= 8
+        for f in folds
     )
-    return "HISTORICAL_PASS_REQUIRES_PAPER_FORWARD" if robust else "REJECT_OR_RESEARCH_FURTHER"
+    diag_ok = (
+        float(diag.get("return_pct", 0)) > 0
+        and float(diag.get("profit_factor", 0)) > 1.0
+        and float(diag.get("max_drawdown_pct", -100)) > -30.0
+        and int(diag.get("cycles", 0)) >= 8
+    )
+    full_ok = (
+        float(full.get("max_drawdown_pct", -100)) > -30.0
+        and float(full.get("profit_factor", 0)) > 1.15
+    )
+    double = next((x for x in stress if float(x["cost_multiplier"]) == 2.0), None)
+    stress_ok = bool(
+        double
+        and float(double.get("return_pct", 0)) > 0
+        and float(double.get("profit_factor", 0)) > 1.0
+        and float(double.get("max_drawdown_pct", -100)) > -35.0
+    )
+    return (
+        "HISTORICAL_PASS_REQUIRES_PAPER_FORWARD"
+        if dev_ok and diag_ok and full_ok and stress_ok
+        else "REJECT_OR_RESEARCH_FURTHER"
+    )
 
 
 def save_pack(out_dir: Path, *, summary: dict, universe_df: pd.DataFrame, train_df: pd.DataFrame, validation_df: pd.DataFrame, result: BacktestResult) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "crypto_rotation_v3_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    (out_dir / "crypto_rotation_v4_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     universe_df.to_csv(out_dir / "universe.csv", index=False)
-    train_df.to_csv(out_dir / "candidate_grid_train.csv", index=False)
-    validation_df.to_csv(out_dir / "shortlist_validation.csv", index=False)
+    train_df.to_csv(out_dir / "candidate_grid_development.csv", index=False)
+    validation_df.to_csv(out_dir / "shortlist_robustness.csv", index=False)
     result.equity.to_csv(out_dir / "selected_equity.csv", index=False)
     result.cycles.to_csv(out_dir / "selected_cycles.csv", index=False)
-    readme = f"""# Crypto Rotation V3 Research Pack
+    readme = f"""# Crypto Rotation V4 Research Pack
 
 Status: {summary['status']}
 
@@ -800,15 +820,16 @@ Research only. No Alpaca orders are placed.
 Selected config:
 {json.dumps(summary['selected']['config'], indent=2)}
 
-V3 methodology notes:
+V4 methodology notes:
 - Evaluation starts at exactly $100,000 with zero pre-evaluation positions.
 - Earlier bars are warmup data only.
 - Stablecoin/cash-like bases are excluded from risk-asset ranking; USD cash remains available.
 - Liquidity is relative: top 15 by trailing 30-day median Alpaca-feed dollar volume.
-- BTC regime controls maximum exposure; BTC realized volatility scales exposure further.
-- Signals use the prior completed UTC daily bar; execution is next UTC daily open.
-- Train and validation choose the candidate using a robustness score.
-- The final historical segment is diagnostic only because V2 results were already viewed.
+- Strict regime control defaults to cash outside confirmed BTC-up conditions.
+- At least four liquid assets must pass momentum/trend before risk is taken.
+- BTC realized volatility scales exposure lower when volatility is high.
+- Four chronological development folds choose the candidate by worst-fold robustness.
+- The final historical segment is diagnostic only and is never used to choose the candidate.
 - True unseen validation must be paper-forward after any historical pass.
 - Long/cash only; no simulated shorting.
 """
@@ -824,14 +845,14 @@ V3 methodology notes:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Research Crypto Rotation V3 using Alpaca historical data.")
+    parser = argparse.ArgumentParser(description="Research Crypto Rotation V4 using Alpaca historical data.")
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
     parser.add_argument("--output-dir", type=Path, default=Path(PACK_DIRNAME))
     args = parser.parse_args()
 
-    print("CRYPTO ROTATION V3 RESEARCH — NO ORDERS WILL BE PLACED")
-    print("V3 accounting fix: no positions/trades before the common evaluation start.")
+    print("CRYPTO ROTATION V4 RESEARCH — NO ORDERS WILL BE PLACED")
+    print("V4 risk controls: strict cash regimes, breadth confirmation, lower volatility targets, four-fold robustness.")
     print("Discovering active Alpaca USD crypto pairs...")
     api = AlpacaCryptoData()
     symbols = api.active_usd_pairs()
@@ -865,7 +886,7 @@ def main() -> int:
 
     matrices = build_matrices(usable_frames)
     if len(matrices.dates) <= WARMUP_DAYS + 300:
-        raise RuntimeError("Not enough daily history for V3 chronological evaluation.")
+        raise RuntimeError("Not enough daily history for V4 chronological evaluation.")
     trade_start_index = WARMUP_DAYS
     eval_dates = matrices.dates[trade_start_index:]
 
@@ -883,7 +904,7 @@ def main() -> int:
     ending = float(selected_result.equity["equity"].iloc[-1])
     summary = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "strategy": "CRYPTO_ROTATION_V3_RESEARCH",
+        "strategy": "CRYPTO_ROTATION_V4_RESEARCH",
         "research_only": True,
         "orders_placed": False,
         "status": status,
@@ -917,9 +938,10 @@ def main() -> int:
             "minimum_trailing_median_dollar_volume": DEFAULT_MIN_MEDIAN_DOLLAR_VOLUME,
             "liquidity_policy": "Rank by trailing 30-day median Alpaca-feed dollar volume; no fixed dollar floor.",
             "regime_profiles": REGIME_PROFILES,
-            "btc_regime_rule": "UP: prior BTC close > SMA100 and 30d momentum > +5%; DOWN: close < SMA100 and momentum < -5%; else SIDEWAYS.",
+            "btc_regime_rule": "UP: prior BTC close > SMA150 and 30d momentum > +5%; DOWN: close < SMA150 and momentum < -5%; else SIDEWAYS.",
             "volatility_scaling": "total exposure *= min(1, target_vol / prior BTC 20d annualized realized vol)",
-            "selection_policy": "train shortlist -> validation robustness score; historical final segment is diagnostic, not unseen",
+            "selection_policy": "four chronological development folds -> worst-fold robustness; final historical segment diagnostic only",
+            "minimum_eligible_breadth": MIN_ELIGIBLE_BREADTH,
             "true_unseen_policy": "paper-forward required before any live consideration",
         },
     }
@@ -934,12 +956,16 @@ def main() -> int:
     )
 
     s = selected_report
-    print("\n=== CRYPTO ROTATION V3 RESULT ===")
+    print("\n=== CRYPTO ROTATION V4 RESULT ===")
     print(f"Status: {status}")
     print(f"Usable pairs: {len(usable_frames)}")
     print(f"Selected config: {s['config']}")
-    print(f"TRAIN: return={s['train']['return_pct']:.2f}% win={s['train']['win_rate_pct']:.1f}% PF={s['train']['profit_factor']:.2f} DD={s['train']['max_drawdown_pct']:.2f}%")
-    print(f"VALIDATION: return={s['validation']['return_pct']:.2f}% win={s['validation']['win_rate_pct']:.1f}% PF={s['validation']['profit_factor']:.2f} DD={s['validation']['max_drawdown_pct']:.2f}%")
+    for f in s["development_folds"]:
+        print(
+            f"DEV FOLD {f['fold']}: return={f['return_pct']:.2f}% "
+            f"win={f['win_rate_pct']:.1f}% PF={f['profit_factor']:.2f} "
+            f"DD={f['max_drawdown_pct']:.2f}%"
+        )
     d = s['historical_diagnostic']
     print(f"HISTORICAL DIAGNOSTIC: return={d['return_pct']:.2f}% win={d['win_rate_pct']:.1f}% PF={d['profit_factor']:.2f} DD={d['max_drawdown_pct']:.2f}%")
     print(f"FULL FROM $100K: return={s['full']['return_pct']:.2f}% win={s['full']['win_rate_pct']:.1f}% PF={s['full']['profit_factor']:.2f} DD={s['full']['max_drawdown_pct']:.2f}%")
