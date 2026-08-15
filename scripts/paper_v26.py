@@ -16,7 +16,7 @@ Strategy:
 - Regular-session market DAY orders submitted outside market hours are queued
   for the next regular trading session by Alpaca.
 
-First run is a preview unless --execute is supplied.
+First run is a preview unless --execute is supplied. Existing non-V26 paper positions are preserved.
 """
 
 from __future__ import annotations
@@ -367,37 +367,45 @@ def _check_account_safety(
     positions: List[dict],
     open_orders: List[dict],
     state: Mapping[str, object],
-    allow_nonempty: bool,
 ) -> None:
     if str(account.get("status", "")).upper() != "ACTIVE":
         raise RuntimeError(f"Paper account status is {account.get('status')!r}, not ACTIVE.")
     if bool(account.get("trading_blocked")):
         raise RuntimeError("Paper account says trading_blocked=true.")
 
-    foreign_orders = [
+    # Sharing the paper account is allowed, but V26 will never touch symbols outside
+    # its own ETF universe. To avoid conflicting automation, block any non-V26 open
+    # order that is already working in a V26-universe symbol.
+    conflicting_orders = [
         o for o in open_orders
-        if not str(o.get("client_order_id", "")).startswith("v26-")
+        if o.get("symbol") in UNIVERSE
+        and not str(o.get("client_order_id", "")).startswith("v26-")
     ]
-    if foreign_orders and not allow_nonempty:
+    if conflicting_orders:
+        symbols = ", ".join(sorted({o.get("symbol", "?") for o in conflicting_orders}))
         raise RuntimeError(
-            f"Found {len(foreign_orders)} non-V26 open order(s). "
-            "Use a clean Alpaca paper account, or pass --allow-nonempty-account "
-            "only if you deliberately want V26 sharing that paper account."
+            "Found non-V26 open order(s) in V26 universe symbol(s): "
+            f"{symbols}. Cancel those paper orders first so two strategies do not "
+            "fight over the same ETF."
         )
 
-    if positions and not state and not allow_nonempty:
-        symbols = ", ".join(sorted(p.get("symbol", "?") for p in positions))
-        raise RuntimeError(
-            "First V26 run found existing positions in the paper account: "
-            f"{symbols}. To avoid interfering with another paper strategy, use a clean "
-            "paper account/reset, or deliberately pass --allow-nonempty-account."
-        )
+    # Existing positions outside UNIVERSE are deliberately ignored and preserved.
+    # Existing positions inside UNIVERSE are treated as V26 inventory and may be
+    # rebalanced, because there is no reliable way to distinguish ownership after fill.
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Frozen V26 Alpaca PAPER rotation runner")
     p.add_argument("--execute", action="store_true")
-    p.add_argument("--allow-nonempty-account", action="store_true")
+    p.add_argument(
+        "--budget",
+        type=float,
+        default=100000.0,
+        help=(
+            "Maximum paper dollars assigned to V26. Existing non-V26 positions are "
+            "preserved. Actual allocation is capped by cash plus current V26 positions."
+        ),
+    )
     p.add_argument("--force-rebalance", action="store_true")
     p.add_argument("--min-order-notional", type=float, default=5.0)
     args = p.parse_args()
@@ -409,9 +417,7 @@ def main() -> int:
     open_orders = api.open_orders()
     state = load_state()
 
-    _check_account_safety(
-        account, positions, open_orders, state, args.allow_nonempty_account
-    )
+    _check_account_safety(account, positions, open_orders, state)
 
     print("CONNECTED TO ALPACA PAPER ENDPOINT ONLY")
     print(f"Account status: {account.get('status')}")
@@ -440,15 +446,33 @@ def main() -> int:
         print("\nNo V26 order is due yet.")
         return 0
 
-    equity = float(account.get("equity") or 0.0)
-    if equity <= 0:
-        raise RuntimeError("Paper account equity is not positive.")
+    requested_budget = float(args.budget)
+    if requested_budget <= 0:
+        raise RuntimeError("--budget must be positive.")
+
+    cash = float(account.get("cash") or 0.0)
+    v26_positions = _position_map(positions)
+    v26_market_value = sum(
+        max(0.0, float(p.get("market_value", 0.0)))
+        for p in v26_positions.values()
+    )
+    allocatable = max(0.0, cash + v26_market_value)
+    strategy_budget = min(requested_budget, allocatable)
+    if strategy_budget <= 0:
+        raise RuntimeError(
+            "No allocatable paper capital is available for V26. "
+            "Cash plus current V26-universe market value is zero."
+        )
+
+    print(f"Requested V26 budget: ${requested_budget:,.2f}")
+    print(f"Available to V26 now: ${allocatable:,.2f}")
+    print(f"V26 strategy budget used: ${strategy_budget:,.2f}")
 
     orders = build_orders(
         session=session,
         targets=targets,
         positions=positions,
-        account_equity=equity,
+        account_equity=strategy_budget,
         min_notional=args.min_order_notional,
     )
 
@@ -508,6 +532,8 @@ def main() -> int:
         "last_signal_session": session,
         "last_targets": targets,
         "last_run_utc": datetime.now(timezone.utc).isoformat(),
+        "requested_budget": requested_budget,
+        "strategy_budget": strategy_budget,
         "last_submitted_orders": submitted,
         "last_failures": failures,
     }
@@ -522,7 +548,8 @@ def main() -> int:
             "targets": targets,
             "submitted": submitted,
             "failures": failures,
-            "paper_equity": equity,
+            "paper_account_equity": float(account.get("equity") or 0.0),
+            "v26_strategy_budget": strategy_budget,
             "market_open": clock.get("is_open"),
             "next_open": clock.get("next_open"),
         }
