@@ -24,10 +24,18 @@ def _slip(price: float, side: int, bps: float) -> float:
     return price * (1 + side * bps / 10_000.0)
 
 
-def run_backtest(raw: pd.DataFrame, strategy_cfg: StrategyConfig | None = None, bt_cfg: BacktestConfig | None = None) -> BacktestResult:
+def run_backtest(
+    raw: pd.DataFrame,
+    strategy_cfg: StrategyConfig | None = None,
+    bt_cfg: BacktestConfig | None = None,
+    *,
+    precomputed_features: pd.DataFrame | None = None,
+) -> BacktestResult:
     sc = strategy_cfg or StrategyConfig()
     bc = bt_cfg or BacktestConfig()
-    df = compute_features(raw, sc).copy()
+    # Risk-only parameter sweeps can reuse an already-built indicator/signal
+    # frame instead of recalculating 30+ indicators for every combination.
+    df = precomputed_features if precomputed_features is not None else compute_features(raw, sc)
 
     cash = bc.initial_capital
     equity = bc.initial_capital
