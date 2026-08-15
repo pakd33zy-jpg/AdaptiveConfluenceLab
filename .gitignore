@@ -8,3 +8,7 @@ walk_forward.json
 .env
 # V26 paper runtime state/logs
 paper/
+
+# Generated crypto research output
+CryptoRotation_research_pack/
+CryptoRotation_research_pack.zip
