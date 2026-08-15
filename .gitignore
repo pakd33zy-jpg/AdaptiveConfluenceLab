@@ -6,3 +6,5 @@ backtest_output/
 *.csv
 walk_forward.json
 .env
+# V26 paper runtime state/logs
+paper/

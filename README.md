@@ -84,3 +84,43 @@ There is no indicator combination that can be guaranteed to be the “most profi
 ## Safety
 
 This repository is for research and paper testing. Do not connect it to live order execution until you have enough out-of-sample and forward-test evidence to justify the risk.
+
+## V26 Alpaca paper runner
+
+`V26` is the frozen ETF momentum-rotation candidate selected during the research loop.
+
+Rules are intentionally hard-coded in `scripts/paper_v26.py` so forward results do
+not silently retune the backtest:
+
+- Universe: SPY, QQQ, IWM, DIA, XLK, XLF, XLE, GLD, TLT
+- 63 completed trading-session momentum
+- Eligible only when momentum is positive and price is above SMA150
+- Rank eligible ETFs by momentum
+- Rebalance after every 5 completed trading sessions
+- 70% to rank #1 and 30% to rank #2
+- If only one ETF qualifies, the remaining 30% stays cash
+- Alpaca **paper endpoint is hard-coded**; this runner does not submit live orders
+
+Set paper credentials in the current shell:
+
+```powershell
+$env:ALPACA_PAPER_API_KEY="YOUR_PAPER_KEY"
+$env:ALPACA_PAPER_SECRET_KEY="YOUR_PAPER_SECRET"
+```
+
+Preview the next V26 action without sending an order:
+
+```powershell
+python .\scripts\paper_v26.py
+```
+
+Submit the proposed orders to Alpaca **paper trading**:
+
+```powershell
+python .\scripts\paper_v26.py --execute
+```
+
+The first execution refuses to touch a non-empty paper account by default. This
+prevents V26 from accidentally interfering with another paper strategy. Use a clean
+paper account/reset when possible. Runtime state and event logs are written under
+`paper/` and are ignored by Git.
