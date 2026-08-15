@@ -15,17 +15,26 @@ sys.path.insert(0, str(ROOT / "src"))
 from adaptive_confluence import BacktestConfig, StrategyConfig, run_backtest
 
 
+MIN_TRAIN_TRADES = 30
+MIN_TEST_TRADES = 10
+
+
 def score(stats):
-    # Do not reward a configuration with too few trades. Profit factor and
-    # expectancy matter more than raw return during selection.
-    if stats["trades"] < 20:
-        return -1e9
+    """Select robust activity first, then risk-adjusted performance.
+
+    Configurations with fewer than MIN_TRAIN_TRADES are intentionally ranked
+    below every sufficiently active configuration. If all are too quiet, the
+    most active one wins so the JSON still exposes the failure mode clearly.
+    """
+    trades = int(stats["trades"])
+    if trades < MIN_TRAIN_TRADES:
+        return -10_000.0 + trades
     pf = min(float(stats["profit_factor"]), 3.0)
     return (
-        float(stats["return_pct"]) * 1.0
-        + pf * 2.0
-        + float(stats["max_drawdown_pct"]) * 1.25
-        + (0.5 if float(stats["expectancy"]) > 0 else -0.5)
+        float(stats["return_pct"])
+        + 2.0 * pf
+        + 1.25 * float(stats["max_drawdown_pct"])
+        + (0.75 if float(stats["expectancy"]) > 0 else -0.75)
     )
 
 
@@ -40,8 +49,18 @@ def fmt_duration(seconds: float) -> str:
     return f"{seconds}s"
 
 
+def candidate_status(train_stats: dict, test_stats: dict) -> str:
+    if int(train_stats["trades"]) < MIN_TRAIN_TRADES:
+        return "REJECT_INSUFFICIENT_TRAIN_ACTIVITY"
+    if int(test_stats["trades"]) < MIN_TEST_TRADES:
+        return "REJECT_INSUFFICIENT_TEST_ACTIVITY"
+    if float(test_stats["expectancy"]) <= 0 or float(test_stats["profit_factor"]) <= 1.0 or float(test_stats["return_pct"]) <= 0:
+        return "REJECT_NEGATIVE_OUT_OF_SAMPLE_EDGE"
+    return "CANDIDATE_FOR_MULTI_SYMBOL_PAPER_VALIDATION"
+
+
 def main():
-    p = argparse.ArgumentParser(description="V2 compact chronological walk-forward sweep")
+    p = argparse.ArgumentParser(description="V2.1 compact chronological walk-forward sweep")
     p.add_argument("csv")
     p.add_argument("--out", default="walk_forward.json")
     args = p.parse_args()
@@ -55,37 +74,34 @@ def main():
     split = int(len(df) * 0.70)
     train, test = df.iloc[:split], df.iloc[split:]
 
-    # V2 deliberately uses a compact grid. The goal is robustness, not finding
-    # one lucky point in an 81-cell search.
+    # Stage 1 tunes entry selectivity only. Exit parameters stay fixed so we do
+    # not confuse a lucky stop/target combination with a real entry edge.
     grid = list(itertools.product(
-        [20.0, 24.0],          # ADX
-        [0.90, 1.05],          # pullback relative volume
-        [1.20, 1.40],          # breakout relative volume
-        [1.20, 1.40],          # breakout stop ATR
-        [2.0, 2.4],            # breakout target R
+        [14.0, 18.0, 22.0],    # ADX
+        [0.50, 0.70],          # pullback relative volume
+        [0.90, 1.10],          # breakout relative volume
+        [10, 16],              # prior channel length
     ))
 
     rows = []
     started = time.perf_counter()
     bt_cfg = BacktestConfig()
     total = len(grid)
-    print(f"V2 walk-forward: {len(train):,} train / {len(test):,} test bars; {total} configs", flush=True)
+    print(f"V2.1 walk-forward: {len(train):,} train / {len(test):,} test bars; {total} configs", flush=True)
 
-    for n, (adx, min_rv, breakout_rv, stop_atr, target_r) in enumerate(grid, 1):
+    for n, (adx, min_rv, breakout_rv, donchian) in enumerate(grid, 1):
         cfg = StrategyConfig(
             trend_adx_min=adx,
             min_relative_volume=min_rv,
             breakout_relative_volume=breakout_rv,
-            breakout_stop_atr=stop_atr,
-            breakout_target_r=target_r,
+            donchian_length=donchian,
         )
         stats = run_backtest(train, cfg, bt_cfg)["stats"]
         rows.append((score(stats), cfg, stats))
         elapsed = time.perf_counter() - started
         eta = elapsed / n * (total - n)
         print(
-            f"[{n:02d}/{total}] adx={adx:.0f} rv={min_rv:.2f}/{breakout_rv:.2f} "
-            f"stop={stop_atr:.2f} target={target_r:.1f} | "
+            f"[{n:02d}/{total}] adx={adx:.0f} rv={min_rv:.2f}/{breakout_rv:.2f} ch={donchian:02d} | "
             f"ret={stats['return_pct']:.3f}% PF={stats['profit_factor']:.2f} "
             f"trades={stats['trades']} | ETA {fmt_duration(eta)}",
             flush=True,
@@ -93,18 +109,25 @@ def main():
 
     rows.sort(key=lambda x: x[0], reverse=True)
     best = rows[0][1]
+    train_stats = rows[0][2]
     test_stats = run_backtest(test, best, bt_cfg)["stats"]
+    status = candidate_status(train_stats, test_stats)
+
     output = {
-        "strategy_version": "V2 trend+breakout",
+        "strategy_version": "V2.1 trend+breakout",
         "method": "70% chronological train / 30% untouched test",
         "tested_configs": total,
+        "minimum_train_trades": MIN_TRAIN_TRADES,
+        "minimum_test_trades": MIN_TEST_TRADES,
         "best_train_config": best.to_dict(),
-        "best_train_stats": rows[0][2],
+        "best_train_stats": train_stats,
         "out_of_sample_test_stats": test_stats,
-        "warning": "A positive backtest is not proof of future profitability. Repeat across symbols/regimes and paper-forward-test.",
+        "candidate_status": status,
+        "warning": "A positive backtest is not proof of future profitability. Pass status only means continue to multi-symbol and paper-forward validation.",
     }
     Path(args.out).write_text(json.dumps(output, indent=2, default=str))
     print(f"Finished in {fmt_duration(time.perf_counter() - started)}", flush=True)
+    print(f"STATUS: {status}", flush=True)
     print(json.dumps(output, indent=2, default=str))
 
 

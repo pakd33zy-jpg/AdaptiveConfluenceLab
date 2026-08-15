@@ -9,39 +9,42 @@ from .indicators import atr, dmi_adx, ema, macd, rsi, session_vwap, sma, validat
 
 @dataclass
 class StrategyConfig:
-    # V2 intentionally uses a smaller set of independent conditions instead of
-    # averaging dozens of correlated indicators into a single score. Legacy V1
-    # fields remain accepted so older scripts/configs do not break; they are not
-    # used by the V2 entry rules unless noted below.
+    """V2.1 trend + breakout research configuration.
+
+    V2.1 keeps explicit entry rules, but removes the excessive stacking that
+    caused V2 to generate almost no trades on multi-year 5-minute data.
+    Legacy V1 fields remain accepted for compatibility with older scripts.
+    """
+
     score_threshold: float = 0.0
     range_adx_max: float = 19.0
     trend_chop_max: float = 55.0
     range_chop_min: float = 57.0
-    trend_adx_min: float = 22.0
-    min_relative_volume: float = 0.90
-    breakout_relative_volume: float = 1.25
-    min_atr_pct: float = 0.05
-    max_atr_pct: float = 1.50
-    donchian_length: int = 20
-    session_start: str = "09:45"
-    session_end: str = "15:30"
 
-    # Risk defaults are deliberately smaller than V1 while the edge is being
-    # validated. Position size is still capped by both stop risk and notional.
+    trend_adx_min: float = 16.0
+    min_relative_volume: float = 0.60
+    breakout_relative_volume: float = 1.00
+    min_atr_pct: float = 0.02
+    max_atr_pct: float = 2.00
+    donchian_length: int = 12
+    session_start: str = "09:40"
+    session_end: str = "15:45"
+
+    # Conservative risk stays in place until an out-of-sample edge is proven.
     risk_pct: float = 0.25
     max_position_pct: float = 20.0
-    trend_stop_atr: float = 1.10
-    trend_target_r: float = 1.80
-    breakout_stop_atr: float = 1.30
-    breakout_target_r: float = 2.20
-    mean_stop_atr: float = 1.00  # retained for API compatibility; V2 does not trade MEAN
+    trend_stop_atr: float = 1.20
+    trend_target_r: float = 1.50
+    breakout_stop_atr: float = 1.35
+    breakout_target_r: float = 1.80
+    mean_stop_atr: float = 1.00  # compatibility only; MEAN remains disabled
     mean_target_r: float = 1.35
     trail_activate_r: float = 1.00
-    trail_atr: float = 1.20
-    max_hold_bars: int = 24
+    trail_atr: float = 1.25
+    max_hold_bars: int = 30
     daily_loss_limit_pct: float = 1.00
     max_trades_per_day: int = 4
-    cooldown_bars: int = 6
+    cooldown_bars: int = 4
     allow_fractional: bool = True
 
     def to_dict(self):
@@ -50,28 +53,28 @@ class StrategyConfig:
 
 def _session_mask(index: pd.Index, start: str, end: str) -> pd.Series:
     if not isinstance(index, pd.DatetimeIndex):
-        return pd.Series(True, index=index)
+        return pd.Series(True, index=index, dtype=bool)
     local = index.tz_convert("America/New_York") if index.tz is not None else index.tz_localize("America/New_York")
     hhmm = local.hour * 60 + local.minute
     sh, sm = (int(x) for x in start.split(":"))
     eh, em = (int(x) for x in end.split(":"))
-    return pd.Series((hhmm >= sh * 60 + sm) & (hhmm <= eh * 60 + em), index=index)
+    return pd.Series((hhmm >= sh * 60 + sm) & (hhmm <= eh * 60 + em), index=index, dtype=bool)
 
 
 def compute_features(raw: pd.DataFrame, cfg: StrategyConfig | None = None) -> pd.DataFrame:
-    """Build the V2 signal frame.
+    """Build the V2.1 signal frame.
 
-    V2 is intentionally simpler than V1. It trades only two playbooks:
-      * TREND: pullback/reclaim in an established EMA/VWAP trend.
-      * BREAKOUT: Donchian break with volume/momentum expansion.
+    The strategy uses two explicit playbooks:
+      * TREND: pullback/reclaim around EMA20 in the direction of the broader bias.
+      * BREAKOUT: prior-channel break with directional flow and usable volume.
 
-    Signals are generated from the completed bar and the backtester enters on
-    the next bar open, so no current-bar close is used as a fill price.
+    Signals are generated from a completed bar and filled by the backtester at
+    the next bar open. Diagnostic boolean columns are intentionally retained so
+    scripts/diagnose_signals.py can show where candidate bars are filtered out.
     """
     cfg = cfg or StrategyConfig()
     out = validate_ohlcv(raw).copy()
 
-    # Core trend / momentum / liquidity features.
     out["ema20"] = ema(out.close, 20)
     out["ema50"] = ema(out.close, 50)
     out["ema200"] = ema(out.close, 200)
@@ -84,29 +87,31 @@ def compute_features(raw: pd.DataFrame, cfg: StrategyConfig | None = None) -> pd
     out["vol_sma20"] = sma(out.volume, 20)
     out["rel_vol"] = out.volume / out.vol_sma20.replace(0, np.nan)
 
-    # Basic candle quality. This avoids counting tiny indecision bars as
-    # confirmations and avoids breakouts that are already extremely stretched.
     bar_range = (out.high - out.low).replace(0, np.nan)
     out["body_ratio"] = (out.close - out.open).abs() / bar_range
     out["ema20_distance_atr"] = (out.close - out.ema20).abs() / out.atr14.replace(0, np.nan)
-
-    # Price structure uses only prior bars for channel levels.
     out["don_high"] = out.high.rolling(cfg.donchian_length, min_periods=cfg.donchian_length).max().shift(1)
     out["don_low"] = out.low.rolling(cfg.donchian_length, min_periods=cfg.donchian_length).min().shift(1)
 
-    long_trend = (out.ema20 > out.ema50) & (out.ema50 > out.ema200)
-    short_trend = (out.ema20 < out.ema50) & (out.ema50 < out.ema200)
-    long_flow = (out.close > out.vwap) & (out.plus_di > out.minus_di) & (out.macd_hist > 0)
-    short_flow = (out.close < out.vwap) & (out.minus_di > out.plus_di) & (out.macd_hist < 0)
-    volatility_ok = out.atr_pct.between(cfg.min_atr_pct, cfg.max_atr_pct)
-    session_ok = _session_mask(out.index, cfg.session_start, cfg.session_end)
+    # V2 required EMA20 > EMA50 > EMA200 simultaneously. V2.1 keeps the
+    # intermediate trend plus a broad price-vs-EMA200 bias, which is materially
+    # less restrictive without abandoning trend context.
+    out["long_trend_ok"] = (out.ema20 > out.ema50) & (out.close > out.ema200)
+    out["short_trend_ok"] = (out.ema20 < out.ema50) & (out.close < out.ema200)
+    out["session_ok"] = _session_mask(out.index, cfg.session_start, cfg.session_end)
+    out["volatility_ok"] = out.atr_pct.between(cfg.min_atr_pct, cfg.max_atr_pct)
+    out["adx_ok"] = out.adx >= cfg.trend_adx_min
+    out["trend_volume_ok"] = out.rel_vol >= cfg.min_relative_volume
+    out["breakout_volume_ok"] = out.rel_vol >= cfg.breakout_relative_volume
+    out["long_vwap_ok"] = out.close > out.vwap
+    out["short_vwap_ok"] = out.close < out.vwap
+    out["long_di_ok"] = out.plus_di > out.minus_di
+    out["short_di_ok"] = out.minus_di > out.plus_di
 
-    # A compact diagnostic score retained for reporting/compatibility. It is not
-    # used as a magic threshold; every entry rule below remains explicit.
     score_parts = pd.concat(
         [
             pd.Series(np.where(out.ema20 > out.ema50, 1.0, -1.0), index=out.index),
-            pd.Series(np.where(out.ema50 > out.ema200, 1.0, -1.0), index=out.index),
+            pd.Series(np.where(out.close > out.ema200, 1.0, -1.0), index=out.index),
             pd.Series(np.where(out.close > out.vwap, 1.0, -1.0), index=out.index),
             np.sign(out.plus_di - out.minus_di),
             np.sign(out.macd_hist),
@@ -114,58 +119,67 @@ def compute_features(raw: pd.DataFrame, cfg: StrategyConfig | None = None) -> pd
         axis=1,
     )
     out["direction_score"] = score_parts.mean(axis=1)
-    out["trend_regime"] = (out.adx >= cfg.trend_adx_min) & (long_trend | short_trend)
-    out["range_regime"] = False  # V2 deliberately disables mean reversion.
-    out["volatility_ok"] = volatility_ok
-    out["chop"] = np.nan  # compatibility with existing smoke tests/reports
+    out["trend_regime"] = out.adx_ok & (out.long_trend_ok | out.short_trend_ok)
+    out["range_regime"] = False
+    out["chop"] = np.nan
 
-    # Trend pullback/reclaim. Require the signal bar to touch the fast trend
-    # reference and close back in the trend direction with momentum improving.
+    # Pullback touch + reclaim. VWAP and MACD are informative diagnostics but
+    # are no longer both hard requirements. DI agreement supplies direction;
+    # the signal bar only needs a modest confirmation candle.
+    out["pull_touch_long"] = (
+        (out.low <= out.ema20 + 0.15 * out.atr14) &
+        (out.low >= out.ema50 - 0.60 * out.atr14)
+    )
+    out["pull_touch_short"] = (
+        (out.high >= out.ema20 - 0.15 * out.atr14) &
+        (out.high <= out.ema50 + 0.60 * out.atr14)
+    )
+    out["pull_confirm_long"] = (
+        (out.close >= out.ema20) &
+        ((out.close > out.open) | (out.close > out.close.shift(1))) &
+        out.rsi14.between(42, 72) &
+        (out.body_ratio >= 0.15)
+    )
+    out["pull_confirm_short"] = (
+        (out.close <= out.ema20) &
+        ((out.close < out.open) | (out.close < out.close.shift(1))) &
+        out.rsi14.between(28, 58) &
+        (out.body_ratio >= 0.15)
+    )
+
     pull_long = (
-        session_ok & volatility_ok & long_trend & long_flow &
-        (out.adx >= cfg.trend_adx_min) &
-        (out.rel_vol >= cfg.min_relative_volume) &
-        ((out.low <= out.ema20) | (out.low <= out.vwap)) &
-        (out.close > out.ema20) &
-        (out.close > out.open) & (out.close > out.close.shift(1)) &
-        out.rsi14.between(50, 68) &
-        (out.macd_hist >= out.macd_hist.shift(1)) &
-        (out.body_ratio >= 0.25)
+        out.session_ok & out.volatility_ok & out.long_trend_ok & out.adx_ok &
+        out.trend_volume_ok & out.long_di_ok & out.pull_touch_long & out.pull_confirm_long
     )
     pull_short = (
-        session_ok & volatility_ok & short_trend & short_flow &
-        (out.adx >= cfg.trend_adx_min) &
-        (out.rel_vol >= cfg.min_relative_volume) &
-        ((out.high >= out.ema20) | (out.high >= out.vwap)) &
-        (out.close < out.ema20) &
-        (out.close < out.open) & (out.close < out.close.shift(1)) &
-        out.rsi14.between(32, 50) &
-        (out.macd_hist <= out.macd_hist.shift(1)) &
-        (out.body_ratio >= 0.25)
+        out.session_ok & out.volatility_ok & out.short_trend_ok & out.adx_ok &
+        out.trend_volume_ok & out.short_di_ok & out.pull_touch_short & out.pull_confirm_short
     )
 
-    # Breakout continuation. A real channel break is required; V1's inside /
-    # outside-bar alternatives were too permissive and created many weak trades.
+    # Breakouts still require VWAP alignment and a prior-channel break, but the
+    # volume/body/RSI gates are moderate enough to produce a testable sample.
+    out["breakout_structure_long"] = (
+        (out.close > out.don_high) & out.rsi14.between(50, 78) &
+        (out.body_ratio >= 0.25) & (out.ema20_distance_atr <= 2.50)
+    )
+    out["breakout_structure_short"] = (
+        (out.close < out.don_low) & out.rsi14.between(22, 50) &
+        (out.body_ratio >= 0.25) & (out.ema20_distance_atr <= 2.50)
+    )
     breakout_long = (
-        session_ok & volatility_ok & long_trend & long_flow &
-        (out.adx >= cfg.trend_adx_min) &
-        (out.rel_vol >= cfg.breakout_relative_volume) &
-        (out.close > out.don_high) &
-        out.rsi14.between(55, 75) &
-        (out.body_ratio >= 0.45) &
-        (out.ema20_distance_atr <= 2.0)
+        out.session_ok & out.volatility_ok & out.long_trend_ok & out.adx_ok &
+        out.breakout_volume_ok & out.long_vwap_ok & out.long_di_ok & out.breakout_structure_long
     )
     breakout_short = (
-        session_ok & volatility_ok & short_trend & short_flow &
-        (out.adx >= cfg.trend_adx_min) &
-        (out.rel_vol >= cfg.breakout_relative_volume) &
-        (out.close < out.don_low) &
-        out.rsi14.between(25, 45) &
-        (out.body_ratio >= 0.45) &
-        (out.ema20_distance_atr <= 2.0)
+        out.session_ok & out.volatility_ok & out.short_trend_ok & out.adx_ok &
+        out.breakout_volume_ok & out.short_vwap_ok & out.short_di_ok & out.breakout_structure_short
     )
 
-    # BREAKOUT gets priority if a bar also qualifies as a pullback continuation.
+    out["pull_long"] = pull_long
+    out["pull_short"] = pull_short
+    out["breakout_long"] = breakout_long
+    out["breakout_short"] = breakout_short
+
     out["long_setup"] = np.select([breakout_long, pull_long], ["BREAKOUT", "TREND"], default="")
     out["short_setup"] = np.select([breakout_short, pull_short], ["BREAKOUT", "TREND"], default="")
     out["signal"] = np.select(

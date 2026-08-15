@@ -93,8 +93,11 @@ def run_backtest(
 
         if position is not None:
             d = position["direction"]
-            position["best_high"] = max(position["best_high"], highs[i])
-            position["best_low"] = min(position["best_low"], lows[i])
+            # Use only extrema known before the current bar when calculating a
+            # trailing stop. Updating best_high/best_low first would let the
+            # current bar move the stop and then hit that newly moved stop in
+            # the same bar, an intrabar ordering assumption that can overstate
+            # results on OHLC data.
             entry = position["entry_price"]
             stop_dist = position["stop_dist"]
             target_r = position["target_r"]
@@ -160,6 +163,11 @@ def run_backtest(
                 })
                 position = None
                 equity = cash
+            else:
+                # No exit occurred, so the current bar's extrema become known
+                # and may influence the trailing stop from the next bar onward.
+                position["best_high"] = max(position["best_high"], highs[i])
+                position["best_low"] = min(position["best_low"], lows[i])
 
         # Signal is from previous completed close; fill is current open.
         if position is None and signals[i - 1] != 0:

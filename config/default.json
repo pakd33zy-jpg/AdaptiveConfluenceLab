@@ -1,13 +1,16 @@
 {
-  "strategy_version": "V2 trend+breakout",
-  "trend_adx_min": 22.0,
-  "min_relative_volume": 0.9,
-  "breakout_relative_volume": 1.25,
-  "min_atr_pct": 0.05,
-  "max_atr_pct": 1.5,
+  "strategy_version": "V2.1 trend+breakout",
+  "trend_adx_min": 16.0,
+  "min_relative_volume": 0.6,
+  "breakout_relative_volume": 1.0,
+  "min_atr_pct": 0.02,
+  "max_atr_pct": 2.0,
+  "donchian_length": 12,
+  "session_start": "09:40",
+  "session_end": "15:45",
   "risk_pct": 0.25,
   "max_position_pct": 20.0,
   "daily_loss_limit_pct": 1.0,
   "max_trades_per_day": 4,
-  "cooldown_bars": 6
+  "cooldown_bars": 4
 }
