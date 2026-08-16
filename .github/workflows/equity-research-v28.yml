@@ -1,0 +1,56 @@
+name: Equity Research V28
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/research_equity_rotation_v28.py"
+      - "tests/test_equity_rotation_v28.py"
+      - ".github/workflows/equity-research-v28.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: equity-research-v28-main
+  cancel-in-progress: true
+
+jobs:
+  equity-research-v28:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+      ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest
+      - name: Run V28 regression tests
+        run: pytest tests/test_equity_rotation_v28.py -q
+      - name: Verify Alpaca paper secrets
+        shell: bash
+        run: |
+          test -n "$ALPACA_PAPER_API_KEY" || (echo "ALPACA_PAPER_API_KEY is missing" && exit 1)
+          test -n "$ALPACA_PAPER_SECRET_KEY" || (echo "ALPACA_PAPER_SECRET_KEY is missing" && exit 1)
+      - name: Run V28 core-anchor equity research
+        run: python scripts/research_equity_rotation_v28.py
+      - name: Upload V28 research pack
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EquityRotationV28-research-pack
+          path: |
+            EquityRotationV28_research_pack/
+            EquityRotationV28_research_pack.zip
+          if-no-files-found: warn
+          retention-days: 30
