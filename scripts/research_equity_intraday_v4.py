@@ -21,6 +21,10 @@ OUT_DIR = Path("EquityIntradayV4_research_pack")
 OUT_ZIP = Path("EquityIntradayV4_research_pack.zip")
 SYMBOLS = ("SPY", "QQQ", "IWM", "AAPL", "NVDA", "MSFT", "AMD", "AMZN", "META", "TSLA", "SOFI", "F", "BAC")
 STARTING_CAPITAL = 100.0
+DYNAMIC_LEADER_COUNT = 5
+MIN_DOLLAR_VOLUME = 1_000_000.0
+_LEADER_CACHE: dict[tuple, dict[pd.Timestamp, set[str]]] = {}
+
 
 def json_default(value):
     if isinstance(value, np.generic):
@@ -53,48 +57,72 @@ class Config:
     slippage_bps_per_side: float = 2.0
 
 def config_grid() -> list[Config]:
-    # V4 searches score thresholds instead of stacking many mandatory booleans.
+    """Fast V4 screen: 24 deliberately broad score-based configurations.
+
+    We keep the soft-scoring idea but avoid a 432-combination brute-force grid.
+    This preserves variation in trend speed, momentum horizon, reward/risk,
+    and score cutoff while holding weakly identified scaling knobs at sensible
+    middle values. A promising winner can be refined later.
+    """
     out = []
     for fast in (8, 12):
         for mom_bars in (3, 6):
-            for mom_floor in (0.08, 0.12, 0.18):
-                for vol_floor in (1.00, 1.15, 1.30):
-                    for extension in (1.0, 1.25):
-                        for target_r in (1.5, 2.0):
-                            for score_cut in (62.0, 68.0, 74.0):
-                                out.append(
-                                    Config(
-                                        fast_ema=fast,
-                                        slow_ema=36,
-                                        momentum_bars=mom_bars,
-                                        min_momentum_pct=mom_floor,
-                                        min_volume_ratio=vol_floor,
-                                        max_vwap_extension_atr=extension,
-                                        stop_atr=1.0,
-                                        target_r=target_r,
-                                        max_hold_bars=6,
-                                        min_setup_score=score_cut,
-                                    )
-                                )
+            for target_r in (1.5, 2.0):
+                for score_cut in (62.0, 68.0, 74.0):
+                    out.append(
+                        Config(
+                            fast_ema=fast,
+                            slow_ema=36,
+                            momentum_bars=mom_bars,
+                            min_momentum_pct=0.12,
+                            min_volume_ratio=1.15,
+                            max_vwap_extension_atr=1.25,
+                            stop_atr=1.0,
+                            target_r=target_r,
+                            max_hold_bars=6,
+                            min_setup_score=score_cut,
+                        )
+                    )
     return out
 
+def _history_cache_key(history: dict[str, pd.DataFrame]) -> tuple:
+    parts = []
+    for symbol in sorted(history):
+        df = history[symbol]
+        if df.empty:
+            parts.append((symbol, 0, None, None))
+        else:
+            parts.append((symbol, len(df), int(df["time"].iloc[0].value), int(df["time"].iloc[-1].value)))
+    return tuple(parts)
+
 def build_dynamic_leader_map(history: dict[str, pd.DataFrame]) -> dict[pd.Timestamp, set[str]]:
+    """Rank affordable active names once per history slice, then cache it."""
+    key = _history_cache_key(history)
+    cached = _LEADER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     rows = []
     for symbol, df in history.items():
         if symbol == "SPY" or df.empty:
             continue
         x = df[["time", "close", "volume"]].copy()
+        # Only rank stocks the $100 research account can actually enter.
+        x = x[x["close"].between(5.0, 100.0)]
+        if x.empty:
+            continue
         x["symbol"] = symbol
         x["dollar_volume"] = x["close"] * x["volume"]
         x["ret_15m"] = x["close"].pct_change(3)
         x["vol_ratio_local"] = x["volume"] / x["volume"].rolling(20, min_periods=5).mean().shift(1)
         rows.append(x)
     if not rows:
+        _LEADER_CACHE[key] = {}
         return {}
 
     panel = pd.concat(rows, ignore_index=True)
     out: dict[pd.Timestamp, set[str]] = {}
-    for ts, g in panel.groupby("time"):
+    for ts, g in panel.groupby("time", sort=False):
         g = g.replace([np.inf, -np.inf], np.nan).dropna(
             subset=["dollar_volume", "ret_15m", "vol_ratio_local"]
         )
@@ -112,6 +140,8 @@ def build_dynamic_leader_map(history: dict[str, pd.DataFrame]) -> dict[pd.Timest
         )
         leaders = g.assign(score=score).nlargest(DYNAMIC_LEADER_COUNT, "score")["symbol"]
         out[pd.Timestamp(ts)] = set(leaders.tolist())
+
+    _LEADER_CACHE[key] = out
     return out
 
 def _headers() -> dict[str, str]:
@@ -488,9 +518,12 @@ def chronological_folds(history: dict[str, pd.DataFrame], folds: int = 4):
 def select_config(history: dict[str, pd.DataFrame]):
     folds = chronological_folds(history, 4)
     rows = []
-    for cfg in config_grid():
+    configs = config_grid()
+    total = len(configs)
+    print(f"FAST V4 GRID: {total} configs x 3 development folds", flush=True)
+    for idx, cfg in enumerate(configs, start=1):
         fold_returns, fold_dds, fold_pfs, fold_trades = [], [], [], []
-        for _, _, h in folds[:3]:  # first 3 folds develop; 4th is final diagnostic
+        for fold_idx, (_, _, h) in enumerate(folds[:3], start=1):
             end, eq, tr = backtest(h, cfg, compound=True)
             m = summarize(STARTING_CAPITAL, end, eq, tr)
             fold_returns.append(float(m["return_pct"]))
@@ -515,8 +548,17 @@ def select_config(history: dict[str, pd.DataFrame]):
             "worst_fold_trades": int(min(fold_trades)),
             "max_fold_drawdown_abs_pct": float(max(abs(x) for x in fold_dds)),
         })
+        pct = 100.0 * idx / total
+        print(
+            f"V4 GRID PROGRESS {idx}/{total} ({pct:5.1f}%) | "
+            f"worst_ret={min(fold_returns):+.2f}% | worst_pf={min(fold_pfs):.2f} | robust={robust}",
+            flush=True,
+        )
+        # Checkpoint after every configuration so an interrupted run still leaves evidence.
+        pd.DataFrame(rows).to_csv(OUT_DIR / "grid_checkpoint.csv", index=False)
+
     table = pd.DataFrame(rows).sort_values(["robust", "selection_score"], ascending=[False, False]).reset_index(drop=True)
-    best = Config(**{k: table.iloc[0][k] for k in asdict(config_grid()[0]).keys()})
+    best = Config(**{k: table.iloc[0][k] for k in asdict(configs[0]).keys()})
     return best, table, folds
 
 def main():
@@ -558,6 +600,7 @@ def main():
         "cost_stress": cost_stress,
         "methodology": {
             "bars": "5-minute Alpaca IEX adjusted bars",
+            "grid_mode": "24-config fast screen with per-config checkpoints; dynamic leader maps cached per fold",
             "history_years": 2.0,
             "signal_execution": "signal on completed bar, entry at next bar open",
             "same_bar_stop_target": "stop-first conservative",
