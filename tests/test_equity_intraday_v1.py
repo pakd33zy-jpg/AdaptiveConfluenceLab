@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "research_equity_intraday_v1.py"
 spec = importlib.util.spec_from_file_location("intraday_v1", SCRIPT)
@@ -69,3 +70,8 @@ def test_costs_are_nonzero():
     cfg = mod.config_grid()[0]
     assert cfg.fee_bps_per_side > 0
     assert cfg.slippage_bps_per_side > 0
+
+
+def test_json_default_handles_numpy_scalars():
+    assert mod.json_default(np.int64(7)) == 7
+    assert mod.json_default(np.float64(1.25)) == 1.25

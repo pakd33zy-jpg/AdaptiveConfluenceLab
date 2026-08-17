@@ -22,6 +22,12 @@ OUT_ZIP = Path("EquityIntradayV1_research_pack.zip")
 SYMBOLS = ("SPY", "QQQ", "IWM", "AAPL", "NVDA", "MSFT", "AMD", "AMZN", "META", "TSLA")
 STARTING_CAPITAL = 100.0
 
+def json_default(value):
+    """Convert NumPy scalar values to ordinary Python values for report JSON."""
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
 # Research only. This file contains no trading/order endpoint and never submits orders.
 ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets")
 ALPACA_PAPER_API_KEY = os.getenv("ALPACA_PAPER_API_KEY", "")
@@ -457,7 +463,7 @@ Starting capital: ${STARTING_CAPITAL:.2f}
 
 Selected config:
 ```json
-{json.dumps(asdict(selected), indent=2)}
+{json.dumps(asdict(selected), indent=2, default=json_default)}
 ```
 
 Final chronological fold, compounded:
