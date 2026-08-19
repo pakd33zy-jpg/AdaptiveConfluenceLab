@@ -1,4 +1,4 @@
-name: Equity Research V31
+name: V31 Strategy Tournament
 
 on:
   workflow_dispatch:
@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   research:
+    name: V31 Research
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -34,20 +35,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e . pytest
-      - name: Regression tests
+      - name: V31 regression tests
         run: pytest tests/test_equity_rotation_v31.py -q
       - name: Verify paper-data credentials
         shell: bash
         run: |
           test -n "$ALPACA_PAPER_API_KEY"
           test -n "$ALPACA_PAPER_SECRET_KEY"
-      - name: Run V31 trend-shock cash-brake research
+      - name: Run V31 strategy tournament
         timeout-minutes: 165
         shell: bash
         run: |
           set -o pipefail
           python scripts/research_equity_rotation_v31.py 2>&1 | tee v31_research.log
-      - name: Upload research pack and log
+      - name: Upload V31 research pack and log
         if: always()
         uses: actions/upload-artifact@v4
         with:
