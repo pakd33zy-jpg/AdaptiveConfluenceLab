@@ -1,0 +1,61 @@
+name: V32 Paper Forward Shadow
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 23:15 UTC = safely after the US regular session year-round.
+    - cron: "15 23 * * 1-5"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/paper_forward_v32.py"
+      - "tests/test_paper_forward_v32.py"
+      - ".github/workflows/paper-forward-v32.yml"
+      - "scripts/research_equity_rotation_v32.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paper-forward-v32
+  cancel-in-progress: true
+
+jobs:
+  forward:
+    name: V32 vs Frozen V26 Shadow
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+      ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+      ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest
+      - name: Forward validator regression tests
+        run: pytest tests/test_paper_forward_v32.py -q
+      - name: Verify data credentials
+        shell: bash
+        run: |
+          test -n "$ALPACA_PAPER_API_KEY"
+          test -n "$ALPACA_PAPER_SECRET_KEY"
+      - name: Run no-order forward shadow
+        shell: bash
+        run: python scripts/paper_forward_v32.py 2>&1 | tee v32_paper_forward.log
+      - name: Upload forward snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: V32-paper-forward-snapshot
+          path: |
+            V32_paper_forward_snapshot/
+            v32_paper_forward.log
+          if-no-files-found: warn
+          retention-days: 90
