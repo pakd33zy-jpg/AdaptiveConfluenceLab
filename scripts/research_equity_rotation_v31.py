@@ -5,6 +5,7 @@ import itertools
 import json
 import os
 import sys
+import types
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
@@ -106,8 +107,22 @@ def exposure_and_mode_v31(m, i, config):
     return exp, str(m.spy_regime[i]), ("risk" if exp > 0 else "cash"), spyvol
 
 
-base.target_weights = target_weights_v31
-base.exposure_and_mode = exposure_and_mode_v31
+# IMPORTANT: V31 must not overwrite the shared V29/V30 module bindings.
+# Build a private copy of V29's run_backtest function globals and replace only
+# the two strategy callbacks inside that private execution environment.
+# This keeps V30 intact while remaining thread-safe for V31's parallel grid.
+_v31_backtest_globals = dict(base.run_backtest.__globals__)
+_v31_backtest_globals["target_weights"] = target_weights_v31
+_v31_backtest_globals["exposure_and_mode"] = exposure_and_mode_v31
+
+run_backtest_v31 = types.FunctionType(
+    base.run_backtest.__code__,
+    _v31_backtest_globals,
+    name="run_backtest_v31",
+    argdefs=base.run_backtest.__defaults__,
+    closure=base.run_backtest.__closure__,
+)
+run_backtest_v31.__kwdefaults__ = dict(base.run_backtest.__kwdefaults__ or {})
 
 
 def configs():
@@ -126,7 +141,7 @@ def configs():
 
 
 def _evaluate_config(m, trade_start, folds, c):
-    res = base.run_backtest(m, c, trade_start_index=trade_start)
+    res = run_backtest_v31(m, c, trade_start_index=trade_start)
     mets = [base.segment_metrics(res, *x) for x in folds]
     scores = [base.metric_score(x) for x in mets]
     row = {**asdict(c)}
@@ -251,7 +266,7 @@ def cost_stress(m, c, trade_start):
     out = []
     for mult in (1.0, 2.0, 4.0):
         cc = base.EquityConfig(**{**asdict(c), "cost_bps": c.cost_bps * mult})
-        r = base.run_backtest(m, cc, trade_start_index=trade_start)
+        r = run_backtest_v31(m, cc, trade_start_index=trade_start)
         out.append({
             "cost_multiplier": mult,
             "cost_bps": cc.cost_bps,
@@ -331,6 +346,7 @@ def main():
             "signal_execution": "prior completed daily bar -> next daily open",
             "strategy_rules_changed_by_this_patch": False,
             "parallel_research_workers": max(1, min(4, os.cpu_count() or 2)),
+            "engine_isolation": "private function globals; V30 shared bindings remain unchanged",
         },
     }
     (out / "equity_rotation_v31_summary.json").write_text(json.dumps(summary, indent=2, default=str))
