@@ -1,0 +1,52 @@
+name: C62 V31 Hard-Brake Research
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/research_c62_v31_hard_brakes.py"
+      - ".github/workflows/c62-v31-hard-brakes.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c62-v31-hard-brakes-main
+  cancel-in-progress: true
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PYTHONUNBUFFERED: "1"
+      ALPACA_PAPER_API_KEY: ${{ secrets.ALPACA_PAPER_API_KEY }}
+      ALPACA_PAPER_SECRET_KEY: ${{ secrets.ALPACA_PAPER_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: Verify data credentials
+        shell: bash
+        run: |
+          test -n "$ALPACA_PAPER_API_KEY"
+          test -n "$ALPACA_PAPER_SECRET_KEY"
+      - name: Run C62 x V31 hard-brake research
+        run: python scripts/research_c62_v31_hard_brakes.py 2>&1 | tee c62_v31_hard_brakes.log
+      - name: Upload research pack
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: C62V31HardBrakes-research-pack
+          path: |
+            C62V31HardBrakes_research_pack/
+            c62_v31_hard_brakes.log
+          if-no-files-found: warn
+          retention-days: 30
